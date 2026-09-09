@@ -70,9 +70,12 @@ PUBLISHED: dict[str, dict[str, Any]] = {
     "leadmagic_role": {
         "needs": "either",
         "billing": "free_on_miss",
-        "credits": 1.0,
-        "unit_usd_low": 0.0104,
-        "unit_usd_high": 0.0245,
+        # Official POST /v1/people/role-finder: 2 credits/hit, free on miss.
+        # People/Company/Jobs Search on Essential+ spends no credits; a receipt
+        # probe sets leadmagic_search_free and this unit becomes $0.
+        "credits": 2.0,
+        "unit_usd_low": 0.0208,
+        "unit_usd_high": 0.049,
         "receipt_lanes": ("domain", "name"),
         "search_may_be_free": True,
     },

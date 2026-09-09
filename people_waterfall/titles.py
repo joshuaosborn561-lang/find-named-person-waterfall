@@ -177,12 +177,9 @@ def audit_title(
     """
     synonyms = title_synonyms or {}
     normalized = apply_synonyms(job_title, synonyms)
-    if (
-        excluded_by_regex(normalized, title_exclude_regex)
-        or excluded_by_regex(job_title, title_exclude_regex)
-        or excluded_by_regex(normalize_title(normalized), title_exclude_regex)
-        or excluded_by_regex(normalize_title(job_title), title_exclude_regex)
-    ):
+    # Exclude against the normalized title only. Raw "Vice President of IT"
+    # contains the word President; normalize_title rewrites that to "vp".
+    if excluded_by_regex(normalize_title(normalized), title_exclude_regex):
         return TitleAudit(False, None, normalized, True, False)
     if not meets_seniority_floor(normalized, seniority_floor):
         return TitleAudit(False, None, normalized, False, True)

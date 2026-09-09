@@ -49,7 +49,7 @@ def contact_payload(
         "title_match": bool(audit.title_match),
         "title_rank": audit.title_rank,
         "linkedin_url": person.linkedin_url or None,
-        "domain": (domain or person.domain or "").strip().lower() or None,
+        "domain": (domain or person.domain or "").strip().lower() or "",
         "company_name": company_name or person.company_name or None,
         "source_tier": source_tier or person.source_tier,
         "source_confidence": source_confidence,
@@ -94,7 +94,7 @@ def write_name_bank(
 ) -> None:
     row = {
         "client_tag": client_tag,
-        "domain": (domain or person.domain or "").strip().lower() or None,
+        "domain": (domain or person.domain or "").strip().lower() or "",
         "first_name": person.first_name or None,
         "last_name": person.last_name or None,
         "job_title": person.title or None,

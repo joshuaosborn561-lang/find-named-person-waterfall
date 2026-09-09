@@ -55,3 +55,13 @@ def test_goliath_it_manager_kept_ceo_dropped():
     )
     assert keep.title_match is True
     assert drop.title_match is False
+
+
+def test_exclude_president_does_not_drop_vice_president_of_it():
+    audit = audit_title(
+        "Vice President of IT",
+        target_titles=["VP of IT", "IT Manager"],
+        title_exclude_regex=r"CEO|CFO|COO|President",
+    )
+    assert audit.excluded is False
+    assert audit.title_match is True
