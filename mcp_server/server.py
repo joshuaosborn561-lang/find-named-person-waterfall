@@ -159,10 +159,13 @@ def receipt_test(
     def worker(job: Any) -> dict[str, Any]:
         return _run(lambda snap: update_job_progress(job.id, snap))
 
+    from people_waterfall.progress import build_counter
+
+    approx_total = max(0, int(n or 15)) * 2
     job = start_job(
         "receipt_test",
         worker,
-        meta={"client_tag": client_tag, "n": n},
+        meta={"client_tag": client_tag, "n": n, "input_rows": approx_total},
     )
     return _json(
         {
@@ -170,6 +173,7 @@ def receipt_test(
             "status": job.status,
             "message": f"Poll get_job_status with job_id={job.id}.",
             "client_tag": client_tag,
+            "counter": build_counter(done=0, total=approx_total, phase="queued"),
         }
     )
 
@@ -201,6 +205,8 @@ def resolve_people(
     """
     _ensure_repo_cwd()
     _reload_settings()
+    from people_waterfall.progress import build_counter
+    from people_waterfall.source import count_source, parse_source
     from people_waterfall.waterfall import resolve_people as _resolve
 
     def _run(progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
@@ -224,6 +230,11 @@ def resolve_people(
         def worker(job: Any) -> dict[str, Any]:
             return _run(lambda snap: update_job_progress(job.id, snap))
 
+        input_rows = None
+        try:
+            input_rows = count_source(parse_source(source_table, where, writeback=False))
+        except Exception:
+            input_rows = None
         job = start_job(
             "resolve_people",
             worker,
@@ -232,6 +243,7 @@ def resolve_people(
                 "source_table": source_table,
                 "where": where,
                 "max_tier": max_tier,
+                "input_rows": input_rows,
             },
         )
         return _json(
@@ -240,6 +252,7 @@ def resolve_people(
                 "status": job.status,
                 "message": f"Poll get_job_status with job_id={job.id}.",
                 "client_tag": client_tag,
+                "counter": build_counter(done=0, total=input_rows, phase="queued"),
             }
         )
     return _json(_run())

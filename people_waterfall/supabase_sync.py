@@ -102,6 +102,48 @@ def rpc(name: str, body: dict[str, Any] | None = None) -> Any:
         return text
 
 
+def rest_exact_count(
+    table: str,
+    *,
+    params: dict[str, str] | None = None,
+    schema: str = "public",
+) -> int | None:
+    """PostgREST Prefer: count=exact. Returns None on failure. Never fetches rows."""
+    try:
+        cfg = supabase_config()
+    except RuntimeError:
+        return None
+    extra = {"Range-Unit": "items", "Range": "0-0"}
+    if schema and schema != "public":
+        extra["Accept-Profile"] = schema
+    query = dict(params or {})
+    query.setdefault("select", "id")
+    qs = f"?{parse.urlencode(query, safe='.,*')}"
+    endpoint = f"{cfg['url'].rstrip('/')}/rest/v1/{table.lstrip('/')}{qs}"
+    req = request.Request(
+        endpoint,
+        headers=_headers(cfg["key"], prefer="count=exact", extra=extra),
+        method="GET",
+    )
+    cr = ""
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            cr = resp.headers.get("Content-Range") or resp.headers.get("content-range") or ""
+    except error.HTTPError as exc:
+        if exc.headers:
+            cr = exc.headers.get("Content-Range") or exc.headers.get("content-range") or ""
+        if exc.code not in (200, 206, 416):
+            return None
+    except Exception:
+        return None
+    if "/" not in cr:
+        return None
+    tail = cr.rsplit("/", 1)[-1].strip()
+    if tail.isdigit():
+        return int(tail)
+    return None
+
+
 def rest_select(
     table: str,
     *,

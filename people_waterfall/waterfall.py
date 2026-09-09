@@ -17,6 +17,7 @@ from .pricing import (
     normalize_tier,
 )
 from .profile import ClientProfile, get_profile, normalize_client_tag
+from .progress import counter_from_stats
 from .source import (
     TableSource,
     count_source,
@@ -322,6 +323,7 @@ def resolve_people(
 
     known = load_known_names(profile) if write_supabase else set()
     spent = 0.0
+    total_rows = count_source(src)
     stats = {
         "companies": 0,
         "resolved": 0,
@@ -338,17 +340,27 @@ def resolve_people(
     deferred = False
     next_tier = None
 
-    def emit() -> None:
+    def emit(phase: str = "running") -> None:
+        snapshot_stats = {
+            **stats,
+            "companies_with_people": int(stats["resolved"]) + int(stats["partial"]),
+            "companies_unresolved": int(stats["people_unresolved"]),
+        }
+        counter = counter_from_stats(snapshot_stats, total=total_rows, phase=phase)
         if progress_callback:
             progress_callback(
                 {
-                    "status": "running" if not deferred else "deferred",
+                    "status": "deferred" if deferred else phase,
                     "client_tag": tag,
-                    "progress": dict(stats),
+                    "input_rows": total_rows,
+                    "progress": dict(snapshot_stats),
+                    "counter": counter,
                     "spent_usd": round(spent, 4),
                     "next_tier": next_tier,
                 }
             )
+
+    emit("running")
 
     for row in iter_source(src):
         stats["companies"] += 1
@@ -494,6 +506,16 @@ def resolve_people(
         "client_tag": tag,
         "source_table": src.qualified,
         "status": "deferred" if deferred else "completed",
+        "input_rows": total_rows,
+        "counter": counter_from_stats(
+            {
+                **stats,
+                "companies_with_people": int(stats["resolved"]) + int(stats["partial"]),
+                "companies_unresolved": int(stats["people_unresolved"]),
+            },
+            total=total_rows,
+            phase="deferred" if deferred else "completed",
+        ),
         "counts": {
             "companies": stats["companies"],
             "resolved": stats["resolved"],

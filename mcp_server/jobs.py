@@ -30,6 +30,7 @@ class Job:
     def to_public(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["progress"] = self.result
+        payload["counter"] = _extract_counter(self)
         return payload
 
 
@@ -72,9 +73,56 @@ def _persist_remote(job: Job) -> None:
         return
 
 
+def _extract_counter(job: Job) -> dict[str, Any]:
+    from people_waterfall.progress import build_counter
+
+    blob = job.result if isinstance(job.result, dict) else {}
+    existing = blob.get("counter")
+    if isinstance(existing, dict) and "done" in existing:
+        return existing
+    stats = blob.get("progress") if isinstance(blob.get("progress"), dict) else None
+    counts = blob.get("counts") if isinstance(blob.get("counts"), dict) else None
+    base = counts or stats or blob
+    total = blob.get("input_rows")
+    if total is None and isinstance(base, dict):
+        total = base.get("input_rows")
+    try:
+        total_n = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        total_n = None
+    done = 0
+    title_matched = 0
+    name_bank = 0
+    with_people = 0
+    unresolved = 0
+    if isinstance(base, dict):
+        done = int(base.get("companies") or base.get("done") or 0)
+        title_matched = int(base.get("title_matched") or 0)
+        name_bank = int(base.get("name_bank") or 0)
+        with_people = int(
+            base.get("companies_with_people")
+            or ((base.get("resolved") or 0) + (base.get("partial") or 0))
+        )
+        unresolved = int(base.get("people_unresolved") or base.get("companies_unresolved") or 0)
+    phase = job.status if job.status in {"queued", "running", "completed", "failed", "deferred"} else "running"
+    if job.status == "queued":
+        done = 0
+        phase = "queued"
+    return build_counter(
+        done=done,
+        total=total_n,
+        title_matched=title_matched,
+        name_bank=name_bank,
+        companies_with_people=with_people,
+        companies_unresolved=unresolved,
+        phase=phase,
+    )
+
+
 def _job_from_payload(data: dict[str, Any], fallback_id: str = "") -> Job | None:
     raw = dict(data)
     raw.pop("progress", None)
+    raw.pop("counter", None)
     if "id" not in raw and fallback_id:
         raw["id"] = fallback_id
     raw.setdefault("kind", "unknown")
@@ -220,13 +268,25 @@ def start_job(
     fn: Callable[[Job], dict[str, Any]],
     meta: dict[str, Any] | None = None,
 ) -> Job:
+    meta = meta or {}
+    total = meta.get("input_rows")
+    try:
+        total_n = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        total_n = None
+    from people_waterfall.progress import build_counter
+
     job = Job(
         id=uuid.uuid4().hex[:12],
         kind=kind,
         status="queued",
         created_at=time.time(),
-        meta=meta or {},
-        result={"message": "queued"},
+        meta=meta,
+        result={
+            "message": "queued",
+            "input_rows": total_n,
+            "counter": build_counter(done=0, total=total_n, phase="queued"),
+        },
     )
     with _lock:
         _jobs[job.id] = job
@@ -235,7 +295,19 @@ def start_job(
     def worker() -> None:
         job.status = "running"
         job.started_at = time.time()
-        job.result = {"message": "running", "progress": {}}
+        from people_waterfall.progress import build_counter
+
+        total = job.meta.get("input_rows") if isinstance(job.meta, dict) else None
+        try:
+            total_n = int(total) if total is not None else None
+        except (TypeError, ValueError):
+            total_n = None
+        job.result = {
+            "message": "running",
+            "input_rows": total_n,
+            "progress": {},
+            "counter": build_counter(done=0, total=total_n, phase="running"),
+        }
         _persist(job)
         try:
             job.result = fn(job) or {}
@@ -247,7 +319,9 @@ def start_job(
             job.result = {
                 "status": "failed",
                 "message": job.error,
+                "input_rows": total_n,
                 "traceback": traceback.format_exc()[-4000:],
+                "counter": build_counter(done=0, total=total_n, phase="failed"),
             }
         finally:
             job.finished_at = time.time()

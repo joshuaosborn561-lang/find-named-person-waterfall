@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from . import supabase_sync
 from .people import PersonHit, company_matches, looks_like_person
+from .progress import build_counter
 from .pricing import LiveRates, compute_tier_order, lane_tiers
 from .profile import ClientProfile, get_profile, normalize_client_tag, update_profile_metrics
 from .source import where_to_filters
@@ -300,9 +301,37 @@ def run_receipt(
         "name": {},
     }
     spent = 0.0
+    receipt_total = len(domain_sample) + len(name_sample)
+    receipt_done = 0
+    receipt_matched = 0
+
+    def emit_receipt(phase: str, lane: str = "", tier: str = "") -> None:
+        if not progress_callback:
+            return
+        counter = build_counter(
+            done=receipt_done,
+            total=receipt_total,
+            title_matched=receipt_matched,
+            phase=phase,
+        )
+        if lane or tier:
+            extra = " · ".join(p for p in (lane, tier) if p)
+            counter["message"] = f"{counter['message']} · {extra}"
+        progress_callback(
+            {
+                "status": phase,
+                "lane": lane,
+                "tier": tier,
+                "input_rows": receipt_total,
+                "spent_usd": round(spent, 4),
+                "counter": counter,
+            }
+        )
+
+    emit_receipt("running")
 
     def run_lane(lane: str, sample: list[dict[str, Any]]) -> None:
-        nonlocal spent
+        nonlocal spent, receipt_done, receipt_matched
         tiers = lane_tiers(order, "domain" if lane == "domain" else "name")
         # Receipt runs every paid tier, including those defaulted off in production.
         extra = []
@@ -353,16 +382,13 @@ def run_receipt(
                     cost = unit * (1 if tier == "prospeo" else max(tally["people"], 1))
                 block["usd"] += cost
                 spent += cost
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "status": "running",
-                            "lane": lane,
-                            "tier": tier,
-                            "spent_usd": round(spent, 4),
-                            "company": company.get("company_name") or company.get("domain"),
-                        }
-                    )
+            receipt_done += 1
+            receipt_matched = sum(
+                int((block or {}).get("title_matched") or 0)
+                for lane_scores in scores.values()
+                for block in lane_scores.values()
+            )
+            emit_receipt("running", lane=lane)
 
     run_lane("domain", domain_sample)
     run_lane("name", name_sample)
@@ -425,12 +451,18 @@ def run_receipt(
         "spent_usd": round(spent, 4),
         "domain_companies": len(domain_sample),
         "name_companies": len(name_sample),
+        "input_rows": receipt_total,
+        "counter": build_counter(
+            done=receipt_done,
+            total=receipt_total,
+            title_matched=receipt_matched,
+            phase="completed",
+        ),
         "per_tier": measured,
         "dropped_tiers": dropped,
         "tier_order": final_order,
         "live_rates": preview["live_rates"],
         "status": "completed",
     }
-    if progress_callback:
-        progress_callback(result)
+    emit_receipt("completed")
     return result

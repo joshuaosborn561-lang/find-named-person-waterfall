@@ -18,7 +18,9 @@ Waterfall `ensure_profile` creates the row.
   prices, drops zero-yield tiers, writes `tier_order`.
 - `get_profile(client_tag)`
 - `get_job_status(job_id)` — last known progress, never a bare error.
-- `list_jobs(limit)`
+  Always includes `counter`: done / total / remaining / pct plus a
+  `message` like "running: 12/100 companies (12.0%)". HTTP: `/job-status?job_id=`.
+- `list_jobs(limit)` — same counter on every row. HTTP: `/jobs`.
 
 ## Ordering
 

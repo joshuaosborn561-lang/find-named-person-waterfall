@@ -280,7 +280,41 @@ def iter_source(src: TableSource) -> Any:
             break
 
 
+def filters_to_query(filters: list[dict[str, str]]) -> dict[str, str]:
+    query: dict[str, str] = {}
+    for item in filters:
+        col = item.get("col") or ""
+        op = item.get("op") or ""
+        if not col:
+            continue
+        if op == "is.null":
+            query[col] = "is.null"
+        elif op == "not.is.null":
+            query[col] = "not.is.null"
+        elif op == "eq":
+            query[col] = f"eq.{item.get('value', '')}"
+        elif op == "neq":
+            query[col] = f"neq.{item.get('value', '')}"
+    return query
+
+
+def count_source_exact(src: TableSource) -> int | None:
+    """Cheap PostgREST count. Falls back to None for schemas PostgREST cannot see."""
+    try:
+        filters = where_to_filters(src.where)
+    except ValueError:
+        return None
+    params = {"select": src.key_column or "id"}
+    params.update(filters_to_query(filters))
+    return supabase_sync.rest_exact_count(src.table, params=params, schema=src.schema)
+
+
 def count_source(src: TableSource, cap: int = 50_000) -> int:
+    exact = count_source_exact(src)
+    if exact is not None:
+        if src.limit is not None:
+            return min(exact, int(src.limit))
+        return exact
     n = 0
     for _ in iter_source(src):
         n += 1
