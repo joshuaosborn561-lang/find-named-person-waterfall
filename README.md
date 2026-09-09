@@ -15,8 +15,8 @@ size bands, ground truth, and cache tables come from
 | `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. |
 | `receipt_test` | Score every tier on ground truth. Write `tier_order`. |
 | `get_profile` | Read-only. Profiles are created by Domain Waterfall `ensure_profile`. |
-| `get_job_status` | Last known progress. Never a bare error. |
-| `list_jobs` | Recent jobs on this process. |
+| `get_job_status` | Last known progress plus `counter` (`done`/`total`/`pct`). Never a bare error. |
+| `list_jobs` | Recent jobs on this process. Same `counter` on every row. |
 
 ## Ordering
 
@@ -59,8 +59,10 @@ HTTPS MCP URL (streamable HTTP, no auth):
 
 Health: `https://people-waterfall-production.up.railway.app/health`
 
-Poll a run without touching it:
+Poll a run without touching it. Response always includes `counter`:
 
 `https://people-waterfall-production.up.railway.app/job-status?job_id=<id>`
+
+Example: `"counter": {"done": 12, "total": 100, "remaining": 88, "pct": 12.0, "message": "running: 12/100 companies (12.0%)"}`
 
 Recent jobs: `https://people-waterfall-production.up.railway.app/jobs`
