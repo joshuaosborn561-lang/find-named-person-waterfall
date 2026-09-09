@@ -10,6 +10,7 @@ def test_unknown_job_is_not_an_error():
     assert "progress" in public or job.result.get("message")
     assert "counter" in public
     assert "done" in public["counter"]
+    assert public["counter"]["phase"] == "unknown"
 
 
 def test_empty_job_id_unknown():

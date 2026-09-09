@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import traceback
@@ -54,6 +55,8 @@ def _persist_remote(job: Job) -> None:
     """Best-effort snapshot so get_job_status works across MCP sessions."""
     if not job.id:
         return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     try:
         from people_waterfall import supabase_sync
 
@@ -104,10 +107,12 @@ def _extract_counter(job: Job) -> dict[str, Any]:
             or ((base.get("resolved") or 0) + (base.get("partial") or 0))
         )
         unresolved = int(base.get("people_unresolved") or base.get("companies_unresolved") or 0)
-    phase = job.status if job.status in {"queued", "running", "completed", "failed", "deferred"} else "running"
+    phase = job.status if job.status in {"queued", "running", "completed", "failed", "deferred", "unknown"} else "running"
     if job.status == "queued":
         done = 0
         phase = "queued"
+    elif job.status == "unknown":
+        phase = "unknown"
     return build_counter(
         done=done,
         total=total_n,
