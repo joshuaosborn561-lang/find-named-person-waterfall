@@ -1,0 +1,10 @@
+[project]
+name = "people-waterfall"
+version = "0.1.0"
+description = "Standalone MCP service: named-person resolver waterfall (no email find)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
