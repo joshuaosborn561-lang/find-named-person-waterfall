@@ -13,7 +13,7 @@ size bands, ground truth, and cache tables come from
 | Tool | Purpose |
 | --- | --- |
 | `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. |
-| `receipt_test` | Score every tier on ground truth. Write `tier_order`. |
+| `receipt_test` | Score every people tier on ground truth. Write `people_tier_order`. |
 | `get_profile` | Read-only. Profiles are created by Domain Waterfall `ensure_profile`. |
 | `get_job_status` | Last known progress plus `counter` (`done`/`total`/`pct`). Never a bare error. |
 | `list_jobs` | Recent jobs on this process. Same `counter` on every row. |
@@ -23,7 +23,9 @@ size bands, ground truth, and cache tables come from
 Cheapest to most expensive, always. Free tiers first. Paid tiers sort on the
 account's live unit price at job start. Free-on-miss sorts on price × measured
 hit rate (default half until a receipt measures it). A receipt may drop a
-zero-yield tier; it does not change the sort rule.
+zero-yield people tier; it does not change the sort rule. People Waterfall
+writes `people_tier_order` / `people_dropped_tiers` / `people_measured_rates`.
+It never reads or writes the domain resolver's shared `tier_order`.
 
 ## Writes
 

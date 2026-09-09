@@ -12,10 +12,12 @@ Waterfall `ensure_profile` creates the row.
 ## Tools
 
 - `resolve_people(source_table, where, client_tag, max_tier, approve_cost_usd, estimate_only, require_title_match)`
-  Source is `source_table` + `where`, paged 500 server side. No inline rows.
-  `estimate_only=true` first on any paid run. Free tiers ignore the cost ceiling.
+  This is the job runner. Source is `source_table` + `where`, paged 500
+  server side. No inline rows. `estimate_only=true` first on any paid run.
+  Free tiers ignore the cost ceiling.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
-  prices, drops zero-yield tiers, writes `tier_order`.
+  prices, drops zero-yield people tiers, writes `people_tier_order`.
+  Never writes the domain resolver's shared `tier_order`.
 - `get_profile(client_tag)`
 - `get_job_status(job_id)` — last known progress, never a bare error.
   Always includes `counter`: done / total / remaining / pct plus a

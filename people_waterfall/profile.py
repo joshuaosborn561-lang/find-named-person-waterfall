@@ -9,6 +9,9 @@ from typing import Any
 
 from . import supabase_sync
 from .config import settings
+from .pricing import PUBLISHED
+
+PEOPLE_TIER_NAMES = frozenset(PUBLISHED) | {"leadmagic_search_free"}
 
 _TAG_RE = re.compile(r"^[a-z][a-z0-9_]{0,46}$")
 RESERVED = frozenset(
@@ -90,10 +93,16 @@ class ClientProfile:
     employee_profiles_max: int | None = None
     ground_truth: dict[str, Any] = field(default_factory=dict)
     cache_tables: list[str] = field(default_factory=list)
-    tier_order: list[dict[str, Any]] = field(default_factory=list)
-    dropped_tiers: list[str] = field(default_factory=list)
-    measured_rates: dict[str, Any] = field(default_factory=dict)
+    people_tier_order: list[dict[str, Any]] = field(default_factory=list)
+    people_dropped_tiers: list[str] = field(default_factory=list)
+    people_measured_rates: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    # Domain Waterfall owns these shared keys. Kept for display only.
+    @property
+    def domain_tier_order(self) -> list[Any]:
+        value = self.raw.get("tier_order")
+        return list(value) if isinstance(value, list) else []
 
     @property
     def contacts_table(self) -> str:
@@ -123,9 +132,10 @@ class ClientProfile:
             "employee_profiles_max": self.employee_profiles_max,
             "ground_truth": dict(self.ground_truth),
             "cache_tables": list(self.cache_tables),
-            "tier_order": list(self.tier_order),
-            "dropped_tiers": list(self.dropped_tiers),
-            "measured_rates": dict(self.measured_rates),
+            "people_tier_order": list(self.people_tier_order),
+            "people_dropped_tiers": list(self.people_dropped_tiers),
+            "people_measured_rates": dict(self.people_measured_rates),
+            "domain_tier_order": list(self.domain_tier_order),
             "contacts_table": f"public.{self.contacts_table}",
         }
 
@@ -149,15 +159,45 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
         employee_profiles_max=int(emp_max) if emp_max not in (None, "") else None,
         ground_truth=dict(gt),
         cache_tables=_as_list(doc.get("cache_tables")),
-        tier_order=list(doc.get("tier_order") or [])
-        if isinstance(doc.get("tier_order"), list)
-        else [],
-        dropped_tiers=_as_list(doc.get("dropped_tiers")),
-        measured_rates=dict(doc.get("measured_rates") or {})
-        if isinstance(doc.get("measured_rates"), dict)
-        else {},
+        people_tier_order=_people_tier_order(doc),
+        people_dropped_tiers=_people_dropped_tiers(doc),
+        people_measured_rates=_people_measured_rates(doc),
         raw=doc,
     )
+
+
+def _people_tier_order(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    own = doc.get("people_tier_order")
+    if isinstance(own, list) and own:
+        return [
+            row
+            for row in own
+            if isinstance(row, dict) and str(row.get("tier") or "") in PUBLISHED
+        ]
+    # Never use domain tier_order (maps / discolike / string names).
+    return []
+
+
+def _people_dropped_tiers(doc: dict[str, Any]) -> list[str]:
+    if "people_dropped_tiers" in doc:
+        return [
+            t
+            for t in _as_list(doc.get("people_dropped_tiers"))
+            if t in PUBLISHED
+        ]
+    # Domain receipts drop cache/aiark/leadmagic for domain search.
+    # Those names are people-finder tiers here — do not inherit them.
+    return []
+
+
+def _people_measured_rates(doc: dict[str, Any]) -> dict[str, Any]:
+    own = doc.get("people_measured_rates")
+    if isinstance(own, dict) and own:
+        return dict(own)
+    shared = doc.get("measured_rates")
+    if not isinstance(shared, dict):
+        return {}
+    return {k: v for k, v in shared.items() if k in PEOPLE_TIER_NAMES}
 
 
 def get_profile(client_tag: str) -> ClientProfile:
@@ -182,7 +222,8 @@ def get_profile(client_tag: str) -> ClientProfile:
             doc = {}
     if not isinstance(doc, dict):
         doc = {}
-    # Columns may sit beside the JSON document.
+    # Columns may sit beside the JSON document. Domain metric columns stay
+    # on the shared keys; people metrics use dedicated people_* columns.
     merged = dict(doc)
     for key in (
         "target_titles",
@@ -199,6 +240,9 @@ def get_profile(client_tag: str) -> ClientProfile:
         "tier_order",
         "dropped_tiers",
         "measured_rates",
+        "people_tier_order",
+        "people_dropped_tiers",
+        "people_measured_rates",
     ):
         if key in row and row[key] not in (None, "", [], {}):
             merged[key] = row[key]
@@ -212,17 +256,37 @@ def update_profile_metrics(
     dropped_tiers: list[str],
     measured_rates: dict[str, Any],
 ) -> None:
+    """Write people_* only. Never touch domain tier_order / dropped_tiers."""
     tag = normalize_client_tag(client_tag)
-    current = get_profile(tag)
+    rows = supabase_sync.rest_select(
+        "wf_client_profiles",
+        params={"client_tag": f"eq.{tag}", "select": "profile"},
+    )
+    doc = {}
+    if rows:
+        raw = rows[0].get("profile")
+        if isinstance(raw, dict):
+            doc = dict(raw)
+        elif isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    doc = parsed
+            except ValueError:
+                doc = {}
+    people_doc = {
+        **doc,
+        "people_tier_order": tier_order,
+        "people_dropped_tiers": dropped_tiers,
+        "people_measured_rates": measured_rates,
+    }
     supabase_sync.rest_patch(
         "wf_client_profiles",
         params={"client_tag": f"eq.{tag}"},
         body={
-            "profile": {
-                **current.raw,
-                "tier_order": tier_order,
-                "dropped_tiers": dropped_tiers,
-                "measured_rates": measured_rates,
-            },
+            "people_tier_order": tier_order,
+            "people_dropped_tiers": dropped_tiers,
+            "people_measured_rates": measured_rates,
+            "profile": people_doc,
         },
     )

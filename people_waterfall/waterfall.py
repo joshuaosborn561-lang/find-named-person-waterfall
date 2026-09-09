@@ -302,16 +302,18 @@ def resolve_people(
     src = parse_source(source_table, where, writeback=write_supabase)
     bundle = vendors or build_vendors()
     stored_free = profile.raw.get("leadmagic_search_free")
-    if stored_free is None and isinstance(profile.measured_rates.get("leadmagic_search_free"), bool):
-        stored_free = profile.measured_rates.get("leadmagic_search_free")
+    if stored_free is None and isinstance(
+        profile.people_measured_rates.get("leadmagic_search_free"), bool
+    ):
+        stored_free = profile.people_measured_rates.get("leadmagic_search_free")
     rates = read_live_rates(
         bundle,
         stored_search_free=stored_free if isinstance(stored_free, bool) else None,
     )
     order = compute_tier_order(
         rates=rates,
-        measured_rates=profile.measured_rates,
-        dropped_tiers=profile.dropped_tiers,
+        measured_rates=profile.people_measured_rates,
+        dropped_tiers=profile.people_dropped_tiers,
     )
     allowed = max_tier_cutoff(max_tier, order)
 

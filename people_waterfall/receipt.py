@@ -245,7 +245,11 @@ def run_receipt(
     profile = get_profile(tag)
     bundle = vendors or build_vendors()
     rates = read_live_rates(bundle, probe_search=True)
-    order = compute_tier_order(rates=rates, measured_rates=profile.measured_rates)
+    order = compute_tier_order(
+        rates=rates,
+        measured_rates=profile.people_measured_rates,
+        dropped_tiers=profile.people_dropped_tiers,
+    )
 
     domain_sample = pick_domain_sample(profile, n)
     name_sample = pick_name_sample(profile, n)
@@ -459,6 +463,8 @@ def run_receipt(
             phase="completed",
         ),
         "per_tier": measured,
+        "people_dropped_tiers": dropped,
+        "people_tier_order": final_order,
         "dropped_tiers": dropped,
         "tier_order": final_order,
         "live_rates": preview["live_rates"],
