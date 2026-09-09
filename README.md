@@ -50,3 +50,11 @@ pytest
 ```
 
 Railway: Dockerfile + `railway.json`. Health check is `/health`.
+
+## Claude custom connector
+
+HTTPS MCP URL (streamable HTTP, no auth):
+
+`https://people-waterfall-production.up.railway.app/mcp`
+
+Health: `https://people-waterfall-production.up.railway.app/health`
