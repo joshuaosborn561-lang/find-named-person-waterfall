@@ -12,6 +12,13 @@ def test_empty_job_id_unknown():
     assert job.status == "unknown"
 
 
+def test_get_job_status_never_raises_on_junk():
+    job = get_job("!!!not-a-job!!!")
+    public = job.to_public()
+    assert public["status"] == "unknown"
+    assert public["progress"] is not None
+
+
 def test_running_job_exposes_progress(tmp_path, monkeypatch):
     from mcp_server import jobs as jobs_mod
 

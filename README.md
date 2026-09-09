@@ -58,3 +58,9 @@ HTTPS MCP URL (streamable HTTP, no auth):
 `https://people-waterfall-production.up.railway.app/mcp`
 
 Health: `https://people-waterfall-production.up.railway.app/health`
+
+Poll a run without touching it:
+
+`https://people-waterfall-production.up.railway.app/job-status?job_id=<id>`
+
+Recent jobs: `https://people-waterfall-production.up.railway.app/jobs`

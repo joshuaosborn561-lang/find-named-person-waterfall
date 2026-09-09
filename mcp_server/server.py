@@ -258,6 +258,8 @@ def _mount_http_routes() -> None:
             "People Waterfall MCP\n"
             "Claude custom connector URL: /mcp\n"
             "Health: /health\n"
+            "Job status: /job-status?job_id=\n"
+            "Jobs: /jobs\n"
             "Auth: none\n"
         )
 
@@ -269,9 +271,28 @@ def _mount_http_routes() -> None:
                 "service": "people-waterfall",
                 "transport": "streamable-http",
                 "mcp_path": "/mcp",
+                "job_status_path": "/job-status",
+                "jobs_path": "/jobs",
                 "auth": "none",
             }
         )
+
+    @mcp.custom_route("/job-status", methods=["GET"])
+    async def job_status_http(request: Request) -> JSONResponse:
+        from mcp_server.jobs import get_job
+
+        job_id = (request.query_params.get("job_id") or "").strip()
+        return JSONResponse(get_job(job_id).to_public())
+
+    @mcp.custom_route("/jobs", methods=["GET"])
+    async def jobs_http(request: Request) -> JSONResponse:
+        from mcp_server.jobs import list_jobs as _list
+
+        try:
+            limit = int(request.query_params.get("limit") or 20)
+        except ValueError:
+            limit = 20
+        return JSONResponse([j.to_public() for j in _list(limit=limit)])
 
 
 _mount_http_routes()
