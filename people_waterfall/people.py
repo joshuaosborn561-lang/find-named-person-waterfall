@@ -80,6 +80,19 @@ def company_matches(
     return prefix in hay
 
 
+def company_name_contains(returned_company: str, queried_company: str) -> bool:
+    """True when personalInfo.companyName contains the queried company name."""
+    hay = " ".join((returned_company or "").lower().split())
+    needle = " ".join((queried_company or "").lower().split())
+    if not hay or not needle:
+        return False
+    if needle in hay:
+        return True
+    hay_c = re.sub(r"[^a-z0-9]", "", hay)
+    needle_c = re.sub(r"[^a-z0-9]", "", needle)
+    return bool(needle_c) and needle_c in hay_c
+
+
 def is_current_employment(row: dict[str, Any]) -> bool | None:
     """Prefer current roles. None = vendor did not expose currency."""
     for key in (

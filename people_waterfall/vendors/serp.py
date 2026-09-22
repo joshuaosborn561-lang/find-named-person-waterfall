@@ -1,9 +1,11 @@
-"""Apify SERP DM lookup. Name+location, no domain required.
+"""Apify SERP DM lookup by company name + target titles.
 
-Fire batches with waitForFinish=0, then poll. Keep a hit only when
-personalInfo.companyName contains the first ten characters of the queried
-company and jobTitle matches after synonyms. Parse name from the profile
-slug; drop under two tokens.
+Query:
+  site:linkedin.com/in "{company_name}" ("Owner" OR "President" OR ...)
+
+Keep a hit only when personalInfo.companyName contains the queried company
+name and personalInfo.jobTitle matches a target title (after synonyms).
+Parse the person name from the LinkedIn slug; drop under two tokens.
 """
 
 from __future__ import annotations
@@ -16,9 +18,8 @@ from people_waterfall import http_client
 from people_waterfall.config import settings
 from people_waterfall.people import (
     PersonHit,
-    company_prefix,
+    company_name_contains,
     name_from_linkedin_slug,
-    person_from_row,
 )
 from people_waterfall.profile import ClientProfile
 from people_waterfall.titles import title_matches
@@ -26,10 +27,17 @@ from people_waterfall.titles import title_matches
 
 def build_query(company_name: str, titles: list[str]) -> str:
     company = (company_name or "").strip()
-    title_clause = " OR ".join(f'"{t}"' for t in titles[:8] if t)
-    if title_clause:
-        return f'site:linkedin.com/in "{company}" ({title_clause})'
+    quoted = [f'"{t.strip()}"' for t in titles if (t or "").strip()]
+    if not company:
+        return ""
+    if quoted:
+        return f'site:linkedin.com/in "{company}" ({" OR ".join(quoted)})'
     return f'site:linkedin.com/in "{company}"'
+
+
+def _job_title_matches(job_title: str, profile: ClientProfile, titles: list[str]) -> bool:
+    pool = [t for t in (titles or list(profile.target_titles)) if t]
+    return any(title_matches(job_title, t, profile.title_synonyms) for t in pool)
 
 
 class SerpClient:
@@ -129,10 +137,12 @@ class SerpClient:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            organic = item.get("organicResults") or item.get("results") or []
-            if isinstance(organic, list):
+            organic = item.get("organicResults")
+            if organic is None:
+                organic = item.get("results")
+            if isinstance(organic, list) and organic:
                 rows.extend(r for r in organic if isinstance(r, dict))
-            elif item.get("url") or item.get("link"):
+            elif item.get("url") or item.get("link") or isinstance(item.get("personalInfo"), dict):
                 rows.append(item)
         return rows
 
@@ -142,44 +152,32 @@ class SerpClient:
         *,
         company_name: str,
         profile: ClientProfile,
+        titles: list[str] | None = None,
     ) -> list[PersonHit]:
-        prefix = company_prefix(company_name)
+        pool = list(titles or profile.target_titles)
         out: list[PersonHit] = []
         seen: set[tuple[str, str]] = set()
         for row in self._organic(items):
+            personal = row.get("personalInfo")
+            if not isinstance(personal, dict):
+                continue
+            returned_company = str(personal.get("companyName") or "").strip()
+            job_title = str(personal.get("jobTitle") or "").strip()
+            if not company_name_contains(returned_company, company_name):
+                continue
+            if not _job_title_matches(job_title, profile, pool):
+                continue
             url = str(row.get("url") or row.get("link") or "")
-            title = str(row.get("title") or "")
-            snippet = str(row.get("description") or row.get("snippet") or "")
-            personal = row.get("personalInfo") if isinstance(row.get("personalInfo"), dict) else {}
-            job_title = str(
-                personal.get("jobTitle") or row.get("jobTitle") or title.split("-")[0]
-            ).strip()
-            returned_company = str(
-                personal.get("companyName") or row.get("companyName") or ""
-            )
-            if prefix:
-                hay = (returned_company or f"{title} {snippet}").lower()
-                if prefix not in "".join(ch for ch in hay if ch.isalnum()) and prefix not in hay.replace(" ", ""):
-                    # still allow organic title/snippet to carry the company
-                    compact = "".join(ch for ch in hay if ch.isalnum())
-                    if prefix not in compact:
-                        continue
             first, last = name_from_linkedin_slug(url)
             if not first:
                 continue
-            if not any(
-                title_matches(job_title, t, profile.title_synonyms)
-                for t in profile.target_titles
-            ):
-                # keep for name_bank via title audit later; still return
-                pass
             person = PersonHit(
                 first_name=first,
                 last_name=last,
                 full_name=f"{first} {last}",
                 title=job_title,
                 linkedin_url=url,
-                company_name=returned_company or company_name,
+                company_name=returned_company,
                 source_tier=self.tier,
                 raw=row,
             )
@@ -209,7 +207,9 @@ class SerpClient:
         if not run_id:
             return []
         items = self.poll_run(run_id)
-        people = self.parse_people(items, company_name=company_name, profile=profile)
+        people = self.parse_people(
+            items, company_name=company_name, profile=profile, titles=titles
+        )
         if people:
             self.hits += 1
         return people[:limit]

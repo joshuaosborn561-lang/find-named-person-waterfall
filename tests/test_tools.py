@@ -13,6 +13,8 @@ def test_resolve_people_is_advertised_first():
     props = schema.get("properties") or {}
     assert "source_table" in props
     assert "client_tag" in props
+    assert "min_tier" in props
+    assert "skip_tiers" in props
     cost = props["approve_cost_usd"]
     assert cost.get("type") == "number"
     assert "anyOf" not in cost

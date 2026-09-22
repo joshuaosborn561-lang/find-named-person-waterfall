@@ -9,6 +9,7 @@ A receipt may drop a zero-yield tier; it never reorders the rule.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -222,18 +223,60 @@ def compute_tier_order(
     return out
 
 
-def max_tier_cutoff(max_tier: str, order: list[dict[str, Any]]) -> list[str]:
-    if not (max_tier or "").strip() or max_tier in {"all", "*"}:
-        return [row["tier"] for row in order if not row.get("dropped")]
-    stop = normalize_tier(max_tier)
-    names: list[str] = []
-    for row in order:
-        if row.get("dropped"):
+def parse_tier_list(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parts = [str(x) for x in value]
+    else:
+        parts = re.split(r"[,\s]+", str(value))
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = normalize_tier(part)
+        if not name or name in seen:
             continue
-        names.append(row["tier"])
-        if row["tier"] == stop:
-            break
-    return names
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def select_tiers(
+    order: list[dict[str, Any]],
+    *,
+    max_tier: str = "all",
+    min_tier: str = "",
+    skip_tiers: str | list[str] | None = None,
+) -> list[str]:
+    """Window the people-tier list.
+
+    min_tier / max_tier slice the live order (inclusive). skip_tiers removes
+    named tiers. An explicit min or max can include a dropped tier so a job
+    can run serp alone after a receipt dropped it.
+    """
+    skip = set(parse_tier_list(skip_tiers))
+    start_raw = (min_tier or "").strip()
+    stop_raw = (max_tier or "").strip()
+    start = normalize_tier(start_raw) if start_raw and start_raw not in {"all", "*"} else ""
+    stop = normalize_tier(stop_raw) if stop_raw and stop_raw not in {"all", "*"} else ""
+
+    if start or stop:
+        names = [row["tier"] for row in order]
+        for extra in (start, stop):
+            if extra and extra in PUBLISHED and extra not in names:
+                names.append(extra)
+    else:
+        names = [row["tier"] for row in order if not row.get("dropped")]
+
+    if start and start in names:
+        names = names[names.index(start) :]
+    if stop and stop in names:
+        names = names[: names.index(stop) + 1]
+    return [name for name in names if name not in skip]
+
+
+def max_tier_cutoff(max_tier: str, order: list[dict[str, Any]]) -> list[str]:
+    return select_tiers(order, max_tier=max_tier)
 
 
 def lane_tiers(order: list[dict[str, Any]], lane: str) -> list[str]:

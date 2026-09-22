@@ -1,4 +1,9 @@
-from people_waterfall.pricing import LiveRates, compute_tier_order, sort_key
+from people_waterfall.pricing import (
+    LiveRates,
+    compute_tier_order,
+    select_tiers,
+    sort_key,
+)
 
 
 def test_free_tiers_sort_first():
@@ -35,3 +40,27 @@ def test_zero_yield_dropped_not_reordered():
     names = [r["tier"] for r in order if not r["dropped"]]
     assert "serp" not in names
     assert names.index("leadmagic_employee") < names.index("aiark")
+
+
+def test_select_tiers_can_run_serp_alone():
+    rates = LiveRates(leadmagic_per_credit=0.01, aiark_per_credit=0.002)
+    order = compute_tier_order(rates=rates)
+    names = select_tiers(order, min_tier="serp", max_tier="serp")
+    assert names == ["serp"]
+
+
+def test_skip_tiers_drops_leadmagic_employee_and_aiark():
+    rates = LiveRates(leadmagic_per_credit=0.01, aiark_per_credit=0.002)
+    order = compute_tier_order(rates=rates)
+    names = select_tiers(order, skip_tiers="leadmagic_employee,aiark")
+    assert "leadmagic_employee" not in names
+    assert "aiark" not in names
+    assert "serp" in names
+    assert names.index("getleads") < names.index("serp")
+
+
+def test_min_tier_can_include_a_dropped_serp():
+    rates = LiveRates()
+    order = compute_tier_order(rates=rates, dropped_tiers=["serp"])
+    assert "serp" not in select_tiers(order)
+    assert select_tiers(order, min_tier="serp", max_tier="serp") == ["serp"]

@@ -12,7 +12,7 @@ size bands, ground truth, and cache tables come from
 
 | Tool | Purpose |
 | --- | --- |
-| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. |
+| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. `min_tier` / `skip_tiers` can isolate SERP. |
 | `receipt_test` | Score every people tier on ground truth. Write `people_tier_order`. |
 | `get_profile` | Read-only. Profiles are created by Domain Waterfall `ensure_profile`. |
 | `get_job_status` | Last known progress plus `counter` (`done`/`total`/`pct`). Never a bare error. |

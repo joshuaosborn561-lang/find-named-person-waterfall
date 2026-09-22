@@ -11,10 +11,13 @@ Waterfall `ensure_profile` creates the row.
 
 ## Tools
 
-- `resolve_people(source_table, where, client_tag, max_tier, approve_cost_usd, estimate_only, require_title_match)`
+- `resolve_people(source_table, where, client_tag, max_tier, min_tier, skip_tiers, approve_cost_usd, estimate_only, require_title_match)`
   This is the job runner. Source is `source_table` + `where`, paged 500
   server side. No inline rows. `estimate_only=true` first on any paid run.
-  Free tiers ignore the cost ceiling.
+  Free tiers ignore the cost ceiling. `min_tier`/`max_tier` window the
+  people-tier order. `skip_tiers` is a comma list. SERP-only:
+  `min_tier=serp` `max_tier=serp`. SERP query is
+  `site:linkedin.com/in "{company}" ("Owner" OR ...target_titles)`.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
   prices, drops zero-yield people tiers, writes `people_tier_order`.
   Never writes the domain resolver's shared `tier_order`.

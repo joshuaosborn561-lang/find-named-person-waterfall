@@ -13,8 +13,8 @@ from .pricing import (
     LiveRates,
     compute_tier_order,
     lane_tiers,
-    max_tier_cutoff,
-    normalize_tier,
+    parse_tier_list,
+    select_tiers,
 )
 from .profile import ClientProfile, get_profile, normalize_client_tag
 from .progress import counter_from_stats
@@ -166,6 +166,24 @@ def _call_tier(
     return client.find_people(**kwargs)
 
 
+def _lane_order(
+    allowed: list[str],
+    order: list[dict[str, Any]],
+    lane: str,
+    company_name: str,
+) -> list[str]:
+    """SERP is company+title search. Include it whenever it is allowed and
+    the row has a company name, even on the domain lane."""
+    lane_set = set(lane_tiers(order, lane))
+    out: list[str] = []
+    for tier in allowed:
+        if tier in lane_set:
+            out.append(tier)
+        elif tier == "serp" and company_name:
+            out.append(tier)
+    return out
+
+
 def _audit_people(
     people: list[PersonHit],
     *,
@@ -269,6 +287,7 @@ def estimate_job(
         "client_tag": profile.client_tag,
         "source_table": src.qualified,
         "rows": rows,
+        "selected_tiers": list(tiers),
         "tiers": per_tier,
         "estimated_usd": round(total, 4),
         "live_rates": {
@@ -290,6 +309,8 @@ def resolve_people(
     where: str = "",
     client_tag: str,
     max_tier: str = "all",
+    min_tier: str = "",
+    skip_tiers: str | list[str] | None = None,
     approve_cost_usd: float | None = None,
     estimate_only: bool = False,
     require_title_match: bool = True,
@@ -315,10 +336,20 @@ def resolve_people(
         measured_rates=profile.people_measured_rates,
         dropped_tiers=profile.people_dropped_tiers,
     )
-    allowed = max_tier_cutoff(max_tier, order)
+    allowed = select_tiers(
+        order,
+        max_tier=max_tier,
+        min_tier=min_tier,
+        skip_tiers=skip_tiers,
+    )
+    skipped = parse_tier_list(skip_tiers)
 
     if estimate_only:
-        return estimate_job(src, profile=profile, rates=rates, order=order, tiers=allowed)
+        quote = estimate_job(src, profile=profile, rates=rates, order=order, tiers=allowed)
+        quote["min_tier"] = min_tier or ""
+        quote["max_tier"] = max_tier
+        quote["skip_tiers"] = skipped
+        return quote
 
     if write_supabase:
         ensure_people_writeback(src)
@@ -373,7 +404,7 @@ def resolve_people(
         first = str(row.get("first_name") or "").strip()
         last = str(row.get("last_name") or "").strip()
         lane = "domain" if domain else "name"
-        lane_order = [t for t in allowed if t in set(lane_tiers(order, lane))]
+        lane_order = _lane_order(allowed, order, lane, company)
         accepted_rows: list[dict[str, Any]] = []
         bank_count = 0
         last_source = ""
@@ -530,6 +561,10 @@ def resolve_people(
         },
         "spent_usd": round(spent, 4),
         "next_tier": next_tier,
+        "min_tier": min_tier or "",
+        "max_tier": max_tier,
+        "skip_tiers": skipped,
+        "selected_tiers": list(allowed),
         "per_tier": stats["per_tier"],
         "tier_order": order,
         "live_rates": {

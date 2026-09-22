@@ -111,6 +111,8 @@ def resolve_people(
     client_tag: str,
     where: str = "",
     max_tier: str = "all",
+    min_tier: str = "",
+    skip_tiers: str = "",
     approve_cost_usd: float = -1,
     estimate_only: bool = True,
     require_title_match: bool = True,
@@ -121,7 +123,9 @@ def resolve_people(
     This is the job runner. estimate_only=true (default) quotes rows and
     live unit prices with no spend. Set estimate_only=false to start a job.
     approve_cost_usd < 0 means no paid ceiling. Free tiers ignore the ceiling.
-    Response is counts / job_id / cost only — never row payloads.
+    min_tier / max_tier are an inclusive window on the people-tier order.
+    skip_tiers is a comma list (e.g. leadmagic_employee,aiark). SERP-only:
+    min_tier=serp max_tier=serp. Response is counts / job_id / cost only.
     """
     _ensure_repo_cwd()
     _reload_settings()
@@ -137,6 +141,8 @@ def resolve_people(
             where=where,
             client_tag=client_tag,
             max_tier=max_tier,
+            min_tier=min_tier,
+            skip_tiers=skip_tiers,
             approve_cost_usd=ceiling,
             estimate_only=bool(estimate_only),
             require_title_match=bool(require_title_match),
@@ -165,6 +171,8 @@ def resolve_people(
                 "source_table": source_table,
                 "where": where,
                 "max_tier": max_tier,
+                "min_tier": min_tier,
+                "skip_tiers": skip_tiers,
                 "input_rows": input_rows,
             },
         )
