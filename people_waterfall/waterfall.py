@@ -35,7 +35,7 @@ from .vendors.leadmagic import LeadMagicClient
 from .vendors.leadmagic import per_credit_from_payload as lm_per_credit
 from .vendors.prospeo import ProspeoClient
 from .vendors.prospeo import per_credit_from_payload as prospeo_per_credit
-from .vendors.serp import SerpClient
+from .vendors.serp import SerpClient, SerpQuery, build_query
 from .vendors.smartlead import SmartleadClient
 from .write import (
     contact_payload,
@@ -182,6 +182,33 @@ def _lane_order(
         elif tier == "serp" and company_name:
             out.append(tier)
     return out
+
+
+def _split_lane(lane_order: list[str]) -> tuple[list[str], bool, list[str]]:
+    if "serp" not in lane_order:
+        return list(lane_order), False, []
+    idx = lane_order.index("serp")
+    return lane_order[:idx], True, lane_order[idx + 1 :]
+
+
+@dataclass
+class _CompanyWork:
+    row: dict[str, Any]
+    domain: str
+    company: str
+    city: str
+    state: str
+    first: str
+    last: str
+    lane_order: list[str]
+    before: list[str]
+    has_serp: bool
+    after: list[str]
+    accepted_rows: list[dict[str, Any]] = field(default_factory=list)
+    bank_count: int = 0
+    last_source: str = ""
+    used_fallback: bool = False
+    deferred: bool = False
 
 
 def _audit_people(
@@ -395,6 +422,218 @@ def resolve_people(
 
     emit("running")
 
+    def _bill(
+        tier: str,
+        people: list[PersonHit],
+        *,
+        unit: float,
+        billing: str,
+        cost_override: float | None = None,
+    ) -> float:
+        nonlocal spent
+        if cost_override is not None:
+            cost = cost_override
+        elif billing == "always":
+            if tier == "serp":
+                cost = unit
+            elif tier == "leadmagic_employee":
+                cost = unit * max(len(people), 0)
+            elif tier == "aiark":
+                cost = unit * len(people)
+            else:
+                cost = unit * max(len(people), 1 if people else 0)
+        elif billing == "free_on_miss" and people:
+            cost = unit * (1 if tier == "prospeo" else len(people))
+            if getattr(bundle.prospeo, "last_free", False) and tier == "prospeo":
+                cost = 0.0
+        else:
+            cost = 0.0
+        spent += cost
+        stats["per_tier"][tier]["usd"] += cost
+        stats["spent_usd"] = spent
+        return cost
+
+    def _apply_people(
+        work: _CompanyWork,
+        tier: str,
+        people: list[PersonHit],
+        *,
+        titles: list[str],
+        fallback: bool,
+    ) -> None:
+        hits, bank = _audit_people(
+            people,
+            profile=profile,
+            company_name=work.company,
+            domain=work.domain,
+            use_fallback=fallback,
+        )
+        for person in bank:
+            if write_supabase:
+                write_name_bank(
+                    client_tag=tag,
+                    domain=work.domain,
+                    person=person,
+                    source=tier,
+                )
+            work.bank_count += 1
+            stats["name_bank"] += 1
+        for person, audit, conf in hits:
+            if is_known(known, work.domain, person):
+                continue
+            known.add(((work.domain or person.domain or ""), person.name_key))
+            work.last_source = tier
+            stats["per_tier"][tier]["title_matched"] += 1
+            stats["title_matched"] += 1
+            if require_title_match or audit.title_match:
+                work.accepted_rows.append(
+                    contact_payload(
+                        person,
+                        audit,
+                        client_tag=tag,
+                        company_name=work.company,
+                        domain=work.domain,
+                        source_tier=tier,
+                        source_confidence=conf,
+                    )
+                )
+
+    def _would_defer(tier: str, unit: float, billing: str, *, n: int = 1) -> bool:
+        nonlocal deferred, next_tier
+        if billing == "free" or approve_cost_usd is None:
+            return False
+        projected = spent + unit * max(1, n)
+        if projected <= approve_cost_usd + 1e-9:
+            return False
+        deferred = True
+        next_tier = tier
+        stats["next_tier"] = tier
+        return True
+
+    def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
+        for tier in tiers:
+            if tier == "serp":
+                continue
+            meta = next((r for r in order if r["tier"] == tier), {})
+            unit = float(meta.get("unit_usd") or 0)
+            billing = meta.get("billing") or "always"
+            if _would_defer(tier, unit, billing):
+                work.deferred = True
+                return
+            people = _call_tier(
+                tier,
+                bundle,
+                profile=profile,
+                domain=work.domain,
+                company_name=work.company,
+                city=work.city,
+                state=work.state,
+                titles=titles,
+                first_name=work.first,
+                last_name=work.last,
+            )
+            stats["per_tier"][tier]["calls"] += 1
+            stats["per_tier"][tier]["people"] += len(people)
+            _bill(tier, people, unit=unit, billing=billing)
+            _apply_people(work, tier, people, titles=titles, fallback=fallback)
+            if work.accepted_rows or deferred:
+                if deferred:
+                    work.deferred = True
+                return
+
+    def run_serp_batch(works: list[_CompanyWork], titles: list[str], fallback: bool) -> None:
+        nonlocal deferred, next_tier
+        if not works or not bundle.serp.enabled:
+            return
+        meta = next((r for r in order if r["tier"] == "serp"), {})
+        unit = float(meta.get("unit_usd") or 0)
+        billing = meta.get("billing") or "always"
+        runnable: list[_CompanyWork] = []
+        jobs: list[SerpQuery] = []
+        for work in works:
+            query = build_query(work.company, titles)
+            if not query:
+                continue
+            if _would_defer("serp", unit, billing):
+                work.deferred = True
+                for rest in works[works.index(work) + 1 :]:
+                    rest.deferred = True
+                break
+            key = str(work.row.get("_source_key") or id(work))
+            runnable.append(work)
+            jobs.append(
+                SerpQuery(
+                    key=key,
+                    query=query,
+                    company_name=work.company,
+                    titles=list(titles),
+                )
+            )
+        if not jobs:
+            return
+        emit("serp")
+        packed = bundle.serp.resolve_queries(jobs, profile=profile, unit=unit)
+        by_key = {item.key: item for item in packed}
+        for work, job in zip(runnable, jobs):
+            item = by_key.get(job.key)
+            people = list(item.people) if item else []
+            cost = float(item.cost_usd) if item else 0.0
+            stats["per_tier"]["serp"]["calls"] += 1
+            stats["per_tier"]["serp"]["people"] += len(people)
+            _bill("serp", people, unit=unit, billing=billing, cost_override=cost)
+            _apply_people(work, "serp", people, titles=titles, fallback=fallback)
+
+    def finalize(work: _CompanyWork) -> None:
+        if work.row.get("_finalized"):
+            return
+        work.row["_finalized"] = True
+        if work.accepted_rows and write_supabase:
+            stats["written"] += write_contacts(profile, work.accepted_rows)
+        if work.deferred:
+            status = "deferred"
+            stats["deferred"] += 1
+        elif work.accepted_rows:
+            status = "resolved"
+            stats["resolved"] += 1
+        elif work.bank_count:
+            status = "partial"
+            stats["partial"] += 1
+        else:
+            status = "people_unresolved"
+            stats["people_unresolved"] += 1
+        if write_supabase:
+            writeback_people(
+                src,
+                work.row.get("_source_key"),
+                count=len(work.accepted_rows),
+                source=work.last_source or ("fallback" if work.used_fallback else ""),
+                status=status,
+            )
+        emit()
+
+    def finalize_rest(works: list[_CompanyWork], *, as_deferred: bool = False) -> None:
+        for work in works:
+            if work.row.get("_finalized"):
+                continue
+            if as_deferred and not work.accepted_rows:
+                work.deferred = True
+            finalize(work)
+
+    def finish_after_serp(works: list[_CompanyWork], titles: list[str], fallback: bool) -> None:
+        for i, work in enumerate(works):
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+                continue
+            if work.after and not deferred:
+                run_pass(work, work.after, titles, fallback)
+            finalize(work)
+            if deferred:
+                finalize_rest(works[i + 1 :], as_deferred=True)
+                break
+
+    pending_serp: list[_CompanyWork] = []
+    pending_after: list[_CompanyWork] = []
+
     for row in iter_source(src):
         stats["companies"] += 1
         domain = str(row.get("domain") or "").strip().lower()
@@ -405,130 +644,101 @@ def resolve_people(
         last = str(row.get("last_name") or "").strip()
         lane = "domain" if domain else "name"
         lane_order = _lane_order(allowed, order, lane, company)
-        accepted_rows: list[dict[str, Any]] = []
-        bank_count = 0
-        last_source = ""
-        used_fallback = False
-
-        def run_pass(titles: list[str], fallback: bool) -> None:
-            nonlocal spent, deferred, next_tier, last_source, bank_count
-            for idx, tier in enumerate(lane_order):
-                meta = next((r for r in order if r["tier"] == tier), {})
-                unit = float(meta.get("unit_usd") or 0)
-                billing = meta.get("billing") or "always"
-                if billing != "free" and approve_cost_usd is not None:
-                    projected = spent + unit
-                    if projected > approve_cost_usd + 1e-9:
-                        deferred = True
-                        next_tier = tier
-                        stats["next_tier"] = tier
-                        return
-                people = _call_tier(
-                    tier,
-                    bundle,
-                    profile=profile,
-                    domain=domain,
-                    company_name=company,
-                    city=city,
-                    state=state,
-                    titles=titles,
-                    first_name=first,
-                    last_name=last,
-                )
-                stats["per_tier"][tier]["calls"] += 1
-                stats["per_tier"][tier]["people"] += len(people)
-                cost = 0.0
-                if billing == "always":
-                    if tier == "serp":
-                        cost = unit
-                    elif tier == "leadmagic_employee":
-                        cost = unit * max(len(people), 0)
-                    else:
-                        cost = unit * max(len(people), 1 if people else 0)
-                        if tier == "aiark":
-                            cost = unit * len(people)
-                    spent += cost
-                elif billing == "free_on_miss":
-                    if people:
-                        cost = unit * (1 if tier == "prospeo" else len(people))
-                        if getattr(bundle.prospeo, "last_free", False) and tier == "prospeo":
-                            cost = 0.0
-                        spent += cost
-                stats["per_tier"][tier]["usd"] += cost
-                stats["spent_usd"] = spent
-                hits, bank = _audit_people(
-                    people,
-                    profile=profile,
-                    company_name=company,
-                    domain=domain,
-                    use_fallback=fallback,
-                )
-                for person in bank:
-                    if write_supabase:
-                        write_name_bank(
-                            client_tag=tag,
-                            domain=domain,
-                            person=person,
-                            source=tier,
-                        )
-                    bank_count += 1
-                    stats["name_bank"] += 1
-                for person, audit, conf in hits:
-                    if is_known(known, domain, person):
-                        continue
-                    known.add(((domain or person.domain or ""), person.name_key))
-                    last_source = tier
-                    stats["per_tier"][tier]["title_matched"] += 1
-                    stats["title_matched"] += 1
-                    if require_title_match or audit.title_match:
-                        accepted_rows.append(
-                            contact_payload(
-                                person,
-                                audit,
-                                client_tag=tag,
-                                company_name=company,
-                                domain=domain,
-                                source_tier=tier,
-                                source_confidence=conf,
-                            )
-                        )
-                if accepted_rows:
-                    return
-                if deferred:
-                    return
-
-        run_pass(list(profile.target_titles), False)
-        if not accepted_rows and profile.fallback_titles and not deferred:
-            used_fallback = True
-            run_pass(list(profile.fallback_titles), True)
-
-        if accepted_rows and write_supabase:
-            stats["written"] += write_contacts(profile, accepted_rows)
-
-        if deferred:
-            status = "deferred"
-            stats["deferred"] += 1
-        elif accepted_rows:
-            status = "resolved"
-            stats["resolved"] += 1
-        elif bank_count:
-            status = "partial"
-            stats["partial"] += 1
+        before, has_serp, after = _split_lane(lane_order)
+        work = _CompanyWork(
+            row=row,
+            domain=domain,
+            company=company,
+            city=city,
+            state=state,
+            first=first,
+            last=last,
+            lane_order=lane_order,
+            before=before,
+            has_serp=has_serp,
+            after=after,
+        )
+        run_pass(work, work.before, list(profile.target_titles), False)
+        if work.accepted_rows or work.deferred:
+            finalize(work)
+            if deferred:
+                break
+            continue
+        if work.has_serp:
+            pending_serp.append(work)
+        elif work.after:
+            pending_after.append(work)
+        elif profile.fallback_titles:
+            work.used_fallback = True
+            run_pass(work, work.before, list(profile.fallback_titles), True)
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+            elif work.has_serp:
+                pending_serp.append(work)
+            else:
+                finalize(work)
+            if deferred:
+                break
         else:
-            status = "people_unresolved"
-            stats["people_unresolved"] += 1
-
-        if write_supabase:
-            writeback_people(
-                src,
-                row.get("_source_key"),
-                count=len(accepted_rows),
-                source=last_source or ("fallback" if used_fallback else ""),
-                status=status,
-            )
+            finalize(work)
         emit()
         if deferred:
             break
+
+    if pending_serp:
+        run_serp_batch(pending_serp, list(profile.target_titles), False)
+        still: list[_CompanyWork] = []
+        for work in pending_serp:
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+            else:
+                still.append(work)
+        fallback_serp: list[_CompanyWork] = []
+        for i, work in enumerate(still):
+            if work.after:
+                run_pass(work, work.after, list(profile.target_titles), False)
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+                if deferred:
+                    finalize_rest(still[i + 1 :], as_deferred=True)
+                    fallback_serp = []
+                    break
+                continue
+            if profile.fallback_titles:
+                work.used_fallback = True
+                run_pass(work, work.before, list(profile.fallback_titles), True)
+                if work.accepted_rows or work.deferred:
+                    finalize(work)
+                elif work.has_serp:
+                    fallback_serp.append(work)
+                else:
+                    if work.after:
+                        run_pass(work, work.after, list(profile.fallback_titles), True)
+                    finalize(work)
+                if deferred:
+                    finalize_rest(still[i + 1 :], as_deferred=True)
+                    fallback_serp = []
+                    break
+            else:
+                finalize(work)
+        if fallback_serp and not deferred:
+            run_serp_batch(fallback_serp, list(profile.fallback_titles), True)
+            finish_after_serp(fallback_serp, list(profile.fallback_titles), True)
+        elif fallback_serp:
+            finalize_rest(fallback_serp, as_deferred=True)
+
+    if pending_after and not deferred:
+        for i, work in enumerate(pending_after):
+            run_pass(work, work.after, list(profile.target_titles), False)
+            if not work.accepted_rows and profile.fallback_titles and not deferred:
+                work.used_fallback = True
+                run_pass(work, work.before + work.after, list(profile.fallback_titles), True)
+            finalize(work)
+            if deferred:
+                finalize_rest(pending_after[i + 1 :], as_deferred=True)
+                break
+    elif pending_after:
+        finalize_rest(pending_after, as_deferred=True)
 
     handoff: dict[str, Any] = {}
     if write_supabase and stats["title_matched"] and not estimate_only:
@@ -566,6 +776,7 @@ def resolve_people(
         "skip_tiers": skipped,
         "selected_tiers": list(allowed),
         "per_tier": stats["per_tier"],
+        "serp_actor_runs": int(getattr(bundle.serp, "runs", 0) or 0),
         "tier_order": order,
         "live_rates": {
             "leadmagic_per_credit": rates.leadmagic_per_credit,

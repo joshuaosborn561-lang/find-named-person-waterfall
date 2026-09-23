@@ -18,6 +18,8 @@ Waterfall `ensure_profile` creates the row.
   people-tier order. `skip_tiers` is a comma list. SERP-only:
   `min_tier=serp` `max_tier=serp`. SERP query is
   `site:linkedin.com/in "{company}" ("Owner" OR ...target_titles)`.
+  SERP batches up to 100 queries per Apify run and starts 2 runs at a
+  time; cost is still $0.0045 per query, not per run.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
   prices, drops zero-yield people tiers, writes `people_tier_order`.
   Never writes the domain resolver's shared `tier_order`.
