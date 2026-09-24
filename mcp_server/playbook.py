@@ -19,7 +19,12 @@ Waterfall `ensure_profile` creates the row.
   `min_tier=serp` `max_tier=serp`. SERP query is
   `site:linkedin.com/in "{company}" ("Owner" OR ...target_titles)`.
   SERP batches up to 100 queries per Apify run and starts 2 runs at a
-  time; cost is still $0.0045 per query, not per run.
+  time; cost is still $0.0045 per query, not per run. The target_titles
+  query is sent first for every company. fallback_titles is queued only
+  when that target query returned no personalInfo.companyName match.
+  Zero-pass companies are written wf_people_status=people_unresolved.
+  counter.done advances when a company is processed and written, not
+  when its query is submitted.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
   prices, drops zero-yield people tiers, writes `people_tier_order`.
   Never writes the domain resolver's shared `tier_order`.

@@ -149,6 +149,24 @@ def test_start_queries_joins_newline_and_counts_per_query(monkeypatch):
     assert client.runs == 1
 
 
+def test_count_company_matches_ignores_title():
+    client = SerpClient(token="")
+    items = [
+        {
+            "organicResults": [
+                {
+                    "personalInfo": {"companyName": "Acme Roofing", "jobTitle": "Sales"},
+                },
+                {
+                    "personalInfo": {"companyName": "Other Co", "jobTitle": "Owner"},
+                },
+            ]
+        }
+    ]
+    assert client.count_company_matches(items, "Acme Roofing") == 1
+    assert client.parse_people(items, company_name="Acme Roofing", profile=PROFILE) == []
+
+
 def test_resolve_queries_maps_by_term_and_bills_unit_per_query():
     acme_q = build_query("Acme Roofing", PROFILE.target_titles)
     beta_q = build_query("Beta Builders", PROFILE.target_titles)

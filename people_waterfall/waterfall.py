@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -420,6 +421,7 @@ def resolve_people(
                 }
             )
 
+    write_lock = threading.Lock()
     emit("running")
 
     def _bill(
@@ -541,26 +543,39 @@ def resolve_people(
                     work.deferred = True
                 return
 
-    def run_serp_batch(works: list[_CompanyWork], titles: list[str], fallback: bool) -> None:
-        nonlocal deferred, next_tier
-        if not works or not bundle.serp.enabled:
+    def run_serp_batch(
+        works: list[_CompanyWork],
+        titles: list[str],
+        fallback: bool,
+        on_each: Callable[[_CompanyWork, Any], None],
+    ) -> None:
+        """Run one title-set batch. on_each fires as each company's dataset lands."""
+        if not works:
+            return
+        if not bundle.serp.enabled:
+            for work in works:
+                on_each(work, None)
             return
         meta = next((r for r in order if r["tier"] == "serp"), {})
         unit = float(meta.get("unit_usd") or 0)
         billing = meta.get("billing") or "always"
-        runnable: list[_CompanyWork] = []
         jobs: list[SerpQuery] = []
-        for work in works:
+        work_by_key: dict[str, _CompanyWork] = {}
+        pending = list(works)
+        for idx, work in enumerate(pending):
             query = build_query(work.company, titles)
             if not query:
+                on_each(work, None)
                 continue
             if _would_defer("serp", unit, billing):
                 work.deferred = True
-                for rest in works[works.index(work) + 1 :]:
+                on_each(work, None)
+                for rest in pending[idx + 1 :]:
                     rest.deferred = True
-                break
+                    on_each(rest, None)
+                return
             key = str(work.row.get("_source_key") or id(work))
-            runnable.append(work)
+            work_by_key[key] = work
             jobs.append(
                 SerpQuery(
                     key=key,
@@ -572,21 +587,28 @@ def resolve_people(
         if not jobs:
             return
         emit("serp")
-        packed = bundle.serp.resolve_queries(jobs, profile=profile, unit=unit)
-        by_key = {item.key: item for item in packed}
-        for work, job in zip(runnable, jobs):
-            item = by_key.get(job.key)
-            people = list(item.people) if item else []
-            cost = float(item.cost_usd) if item else 0.0
-            stats["per_tier"]["serp"]["calls"] += 1
-            stats["per_tier"]["serp"]["people"] += len(people)
-            _bill("serp", people, unit=unit, billing=billing, cost_override=cost)
-            _apply_people(work, "serp", people, titles=titles, fallback=fallback)
+
+        def on_chunk(packed: list[Any]) -> None:
+            with write_lock:
+                for item in packed:
+                    work = work_by_key.get(getattr(item, "key", ""))
+                    if work is None:
+                        continue
+                    people = list(getattr(item, "people", None) or [])
+                    cost = float(getattr(item, "cost_usd", 0) or 0)
+                    stats["per_tier"]["serp"]["calls"] += 1
+                    stats["per_tier"]["serp"]["people"] += len(people)
+                    _bill("serp", people, unit=unit, billing=billing, cost_override=cost)
+                    _apply_people(work, "serp", people, titles=titles, fallback=fallback)
+                    on_each(work, item)
+
+        bundle.serp.resolve_queries(jobs, profile=profile, unit=unit, on_chunk=on_chunk)
 
     def finalize(work: _CompanyWork) -> None:
         if work.row.get("_finalized"):
             return
         work.row["_finalized"] = True
+        stats["companies"] += 1
         if work.accepted_rows and write_supabase:
             stats["written"] += write_contacts(profile, work.accepted_rows)
         if work.deferred:
@@ -606,7 +628,7 @@ def resolve_people(
                 src,
                 work.row.get("_source_key"),
                 count=len(work.accepted_rows),
-                source=work.last_source or ("fallback" if work.used_fallback else ""),
+                source=work.last_source or ("fallback" if work.used_fallback else "serp"),
                 status=status,
             )
         emit()
@@ -619,23 +641,12 @@ def resolve_people(
                 work.deferred = True
             finalize(work)
 
-    def finish_after_serp(works: list[_CompanyWork], titles: list[str], fallback: bool) -> None:
-        for i, work in enumerate(works):
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-                continue
-            if work.after and not deferred:
-                run_pass(work, work.after, titles, fallback)
-            finalize(work)
-            if deferred:
-                finalize_rest(works[i + 1 :], as_deferred=True)
-                break
-
     pending_serp: list[_CompanyWork] = []
     pending_after: list[_CompanyWork] = []
+    target_titles = list(profile.target_titles)
+    fallback_titles = list(profile.fallback_titles)
 
     for row in iter_source(src):
-        stats["companies"] += 1
         domain = str(row.get("domain") or "").strip().lower()
         company = str(row.get("company_name") or "").strip()
         city = str(row.get("city") or "").strip()
@@ -658,7 +669,7 @@ def resolve_people(
             has_serp=has_serp,
             after=after,
         )
-        run_pass(work, work.before, list(profile.target_titles), False)
+        run_pass(work, work.before, target_titles, False)
         if work.accepted_rows or work.deferred:
             finalize(work)
             if deferred:
@@ -666,66 +677,50 @@ def resolve_people(
             continue
         if work.has_serp:
             pending_serp.append(work)
-        elif work.after:
+            continue
+        if work.after:
             pending_after.append(work)
-        elif profile.fallback_titles:
+            continue
+        if fallback_titles:
             work.used_fallback = True
-            run_pass(work, work.before, list(profile.fallback_titles), True)
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-            elif work.has_serp:
-                pending_serp.append(work)
-            else:
-                finalize(work)
-            if deferred:
-                break
-        else:
-            finalize(work)
-        emit()
+            run_pass(work, work.before, fallback_titles, True)
+        finalize(work)
         if deferred:
             break
 
-    if pending_serp:
-        run_serp_batch(pending_serp, list(profile.target_titles), False)
-        still: list[_CompanyWork] = []
-        for work in pending_serp:
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-            else:
-                still.append(work)
-        fallback_serp: list[_CompanyWork] = []
-        for i, work in enumerate(still):
+    fallback_serp: list[_CompanyWork] = []
+
+    def after_target(work: _CompanyWork, item: Any) -> None:
+        if work.accepted_rows or work.deferred:
+            finalize(work)
+            return
+        company_matched = int(getattr(item, "company_matched", 0) or 0) if item else 0
+        if company_matched:
             if work.after:
-                run_pass(work, work.after, list(profile.target_titles), False)
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-                if deferred:
-                    finalize_rest(still[i + 1 :], as_deferred=True)
-                    fallback_serp = []
-                    break
-                continue
-            if profile.fallback_titles:
-                work.used_fallback = True
-                run_pass(work, work.before, list(profile.fallback_titles), True)
-                if work.accepted_rows or work.deferred:
-                    finalize(work)
-                elif work.has_serp:
-                    fallback_serp.append(work)
-                else:
-                    if work.after:
-                        run_pass(work, work.after, list(profile.fallback_titles), True)
-                    finalize(work)
-                if deferred:
-                    finalize_rest(still[i + 1 :], as_deferred=True)
-                    fallback_serp = []
-                    break
-            else:
-                finalize(work)
+                run_pass(work, work.after, target_titles, False)
+            finalize(work)
+            return
+        if fallback_titles:
+            work.used_fallback = True
+            fallback_serp.append(work)
+            return
+        if work.after:
+            run_pass(work, work.after, target_titles, False)
+        finalize(work)
+
+    def after_fallback(work: _CompanyWork, item: Any) -> None:
+        if not work.accepted_rows and not work.deferred and work.after:
+            run_pass(work, work.after, fallback_titles, True)
+        finalize(work)
+
+    if pending_serp:
+        emit("serp")
+        run_serp_batch(pending_serp, target_titles, False, after_target)
         if fallback_serp and not deferred:
-            run_serp_batch(fallback_serp, list(profile.fallback_titles), True)
-            finish_after_serp(fallback_serp, list(profile.fallback_titles), True)
+            run_serp_batch(fallback_serp, fallback_titles, True, after_fallback)
         elif fallback_serp:
             finalize_rest(fallback_serp, as_deferred=True)
+        finalize_rest(pending_serp)
 
     if pending_after and not deferred:
         for i, work in enumerate(pending_after):
