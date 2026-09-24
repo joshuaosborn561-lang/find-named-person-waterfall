@@ -136,6 +136,7 @@ class SerpQueryResult:
     cost_usd: float
     run_id: str = ""
     started: bool = False
+    company_matched: int = 0
 
 
 class SerpClient:
@@ -269,6 +270,23 @@ class SerpClient:
                 rows.append(item)
         return rows
 
+    def count_company_matches(
+        self, items: list[dict[str, Any]], company_name: str
+    ) -> int:
+        """Hits whose personalInfo.companyName contains the queried company.
+
+        Title is ignored. Used to decide whether a fallback_titles query is
+        worth sending.
+        """
+        n = 0
+        for row in self._organic(items):
+            personal = row.get("personalInfo")
+            if not isinstance(personal, dict):
+                continue
+            if company_name_contains(str(personal.get("companyName") or ""), company_name):
+                n += 1
+        return n
+
     def parse_people(
         self,
         items: list[dict[str, Any]],
@@ -323,6 +341,7 @@ class SerpClient:
                 cost_usd=cost,
                 run_id=run_id,
                 started=started,
+                company_matched=0,
             )
             for job in jobs
         ]
@@ -349,6 +368,7 @@ class SerpClient:
                 profile=profile,
                 titles=job.titles or None,
             )
+            company_matched = self.count_company_matches(matched, job.company_name)
             if people:
                 with self._lock:
                     self.hits += 1
@@ -360,6 +380,7 @@ class SerpClient:
                     cost_usd=unit,
                     run_id=run_id,
                     started=True,
+                    company_matched=company_matched,
                 )
             )
         return packed
@@ -372,26 +393,39 @@ class SerpClient:
         unit: float = 0.0045,
         concurrency: int | None = None,
         chunk_size: int | None = None,
+        on_chunk: Any | None = None,
     ) -> list[SerpQueryResult]:
-        """Start up to 100-query actor runs, 2 at a time, map by searchQuery.term."""
+        """Start up to 100-query actor runs, 2 at a time, map by searchQuery.term.
+
+        on_chunk(packed) fires as each actor run lands so the waterfall can
+        write back and advance the counter before the rest of the job finishes.
+        """
         if not self.enabled or not jobs:
-            return self._empty_results(jobs, unit=unit, started=False)
+            empty = self._empty_results(jobs, unit=unit, started=False)
+            if on_chunk and empty:
+                on_chunk(empty)
+            return empty
         size = SERP_CHUNK if chunk_size is None else max(1, int(chunk_size))
         chunks = list(chunked(jobs, size))
         workers = concurrency if concurrency is not None else serp_run_concurrency()
         workers = max(1, min(int(workers), len(chunks)))
 
+        def _run(chunk: list[SerpQuery]) -> list[SerpQueryResult]:
+            packed = self._resolve_chunk(chunk, profile=profile, unit=unit)
+            if on_chunk:
+                on_chunk(packed)
+            return packed
+
         if workers == 1:
             out: list[SerpQueryResult] = []
             for chunk in chunks:
-                out.extend(self._resolve_chunk(chunk, profile=profile, unit=unit))
+                out.extend(_run(chunk))
             return out
 
         by_index: dict[int, list[SerpQueryResult]] = {}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {
-                pool.submit(self._resolve_chunk, chunk, profile=profile, unit=unit): i
-                for i, chunk in enumerate(chunks)
+                pool.submit(_run, chunk): i for i, chunk in enumerate(chunks)
             }
             for fut in as_completed(futs):
                 by_index[futs[fut]] = fut.result()
