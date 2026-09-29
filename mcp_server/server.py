@@ -124,8 +124,8 @@ def resolve_people(
     live unit prices with no spend. Set estimate_only=false to start a job.
     approve_cost_usd < 0 means no paid ceiling. Free tiers ignore the ceiling.
     min_tier / max_tier are an inclusive window on the people-tier order.
-    skip_tiers is a comma list (e.g. leadmagic_employee,aiark). SERP-only:
-    min_tier=serp max_tier=serp. Response is counts / job_id / cost only.
+    skip_tiers is a comma list (e.g. leadmagic_employee). DiscoLike-only:
+    min_tier=discolike max_tier=discolike. Response is counts / job_id / cost only.
     """
     _ensure_repo_cwd()
     _reload_settings()

@@ -1,8 +1,4 @@
-"""LeadMagic employee finder (0.05 cr) and role/people search.
-
-Live /v1/credits is read at job start. If people search spends no credits
-on this plan, find_people_by_role is treated as free.
-"""
+"""LeadMagic employee finder (0.05 cr/hit). Live /v1/credits is read at job start."""
 
 from __future__ import annotations
 
@@ -131,101 +127,6 @@ class LeadMagicClient:
             self.hits += 1
         return people
 
-    def find_people_by_role(
-        self,
-        *,
-        profile: ClientProfile,
-        domain: str = "",
-        company_name: str = "",
-        city: str = "",
-        state: str = "",
-        titles: list[str] | None = None,
-        limit: int = 20,
-    ) -> list[PersonHit]:
-        if not self.enabled or not (domain or company_name):
-            return []
-        titles = titles or list(profile.target_titles)
-        location = " ".join(p for p in (city, state) if p).strip()
-        found: list[PersonHit] = []
-        seen: set[tuple[str, str]] = set()
-        # Group titles so we do not fire one call per title on a long list.
-        groups: list[list[str]] = []
-        chunk: list[str] = []
-        for title in titles:
-            chunk.append(title)
-            if len(chunk) >= 4:
-                groups.append(chunk)
-                chunk = []
-        if chunk:
-            groups.append(chunk)
-        for group in groups[:6]:
-            self.last_credits_used = None
-            body: dict[str, Any] = {
-                "job_title": ", ".join(group),
-                "company_name": company_name or domain,
-            }
-            if domain:
-                body["company_domain"] = domain
-                body["domain"] = domain
-            if location:
-                body["location"] = location
-            status, data = self._request("POST", "/v1/people/role-finder", body)
-            if status >= 400 or data is None:
-                status, data = self._request("POST", "/v1/people/search", body)
-            if status >= 400 or data is None:
-                status, data = self._request("POST", "/role-finder", body)
-            for person in self._absorb(data, "leadmagic_role", limit):
-                key = (person.first_name.lower(), person.last_name.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                found.append(person)
-            if len(found) >= limit:
-                break
-        if found:
-            self.hits += 1
-        return found[:limit]
-
-    def probe_search_free(self) -> bool | None:
-        """Compare credits before/after a miss-safe role search. None if unknown."""
-        before = self.credits()
-        bal_before = _credit_balance(before)
-        if bal_before is None:
-            return None
-        status, data = self._request(
-            "POST",
-            "/v1/people/role-finder",
-            {
-                "job_title": "Project Manager",
-                "company_name": "ZZZ Nonexistent Company XYZ 2099",
-                "location": "Dallas TX",
-            },
-        )
-        after = self.credits()
-        bal_after = _credit_balance(after)
-        used = None
-        if isinstance(data, dict):
-            raw_used = data.get("credits_used") or data.get("credits")
-            if isinstance(raw_used, (int, float)):
-                used = float(raw_used)
-        if used is not None:
-            return used == 0
-        if bal_after is None:
-            return None
-        return bal_after >= bal_before
-
-
-def _credit_balance(payload: dict[str, Any]) -> float | None:
-    for key in ("credits", "remaining", "balance", "credits_remaining", "available"):
-        val = payload.get(key)
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, dict):
-            inner = val.get("remaining") or val.get("balance") or val.get("credits")
-            if isinstance(inner, (int, float)):
-                return float(inner)
-    return None
-
 
 def per_credit_from_payload(payload: dict[str, Any]) -> tuple[float | None, str]:
     plan = str(
@@ -238,7 +139,6 @@ def per_credit_from_payload(payload: dict[str, Any]) -> tuple[float | None, str]
         val = payload.get(key)
         if isinstance(val, (int, float)) and val > 0:
             return float(val), plan
-    # Infer from plan name using the published table.
     plan_l = plan.lower()
     mapping = {
         "basic": 0.024995,

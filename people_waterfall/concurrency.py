@@ -12,25 +12,15 @@ from typing import Iterator
 import requests
 
 TIER_ENV_KEYS: dict[str, str] = {
-    "getleads": "GETLEADS_CONCURRENCY",
-    "smartlead": "SMARTLEAD_CONCURRENCY",
-    "aiark": "AIARK_CONCURRENCY",
     "leadmagic": "LEADMAGIC_CONCURRENCY",
     "leadmagic_employee": "LEADMAGIC_CONCURRENCY",
-    "leadmagic_role": "LEADMAGIC_CONCURRENCY",
-    "prospeo": "PROSPEO_CONCURRENCY",
-    "serp": "SERP_CONCURRENCY",
+    "discolike": "DISCOLIKE_CONCURRENCY",
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
-    "getleads": 10,
-    "smartlead": 10,
-    "aiark": 8,
     "leadmagic": 6,
     "leadmagic_employee": 6,
-    "leadmagic_role": 6,
-    "prospeo": 6,
-    "serp": 4,
+    "discolike": 1,
 }
 
 DEFAULT_COMPANY_CONCURRENCY = 20
@@ -105,7 +95,7 @@ def request_with_retry(
     max_attempts: int | None = None,
     **kwargs: object,
 ) -> requests.Response | None:
-    attempts = max_attempts if max_attempts is not None else (5 if tier == "smartlead" else 3)
+    attempts = max_attempts if max_attempts is not None else 3
     last: requests.Response | None = None
     with vendor_gate.acquire(tier):
         for attempt in range(attempts):

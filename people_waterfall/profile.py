@@ -11,29 +11,7 @@ from . import supabase_sync
 from .config import settings
 from .pricing import PUBLISHED
 
-PEOPLE_TIER_NAMES = frozenset(PUBLISHED) | {"leadmagic_search_free"}
-DEFAULT_SERP_STYLES = ("a", "b", "c", "d")
-SERP_STYLE_TIERS = frozenset("serp_" + letter for letter in DEFAULT_SERP_STYLES)
-
-
-def normalize_serp_styles(value: Any) -> list[str]:
-    if value is None or value == "":
-        return list(DEFAULT_SERP_STYLES)
-    if isinstance(value, str):
-        parts = re.split(r"[,\s]+", value)
-    elif isinstance(value, (list, tuple)):
-        parts = [str(x) for x in value]
-    else:
-        return list(DEFAULT_SERP_STYLES)
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        letter = str(part or "").strip().lower().removeprefix("serp_")
-        if letter not in DEFAULT_SERP_STYLES or letter in seen:
-            continue
-        seen.add(letter)
-        out.append(letter)
-    return out or list(DEFAULT_SERP_STYLES)
+PEOPLE_TIER_NAMES = frozenset(PUBLISHED)
 
 _TAG_RE = re.compile(r"^[a-z][a-z0-9_]{0,46}$")
 RESERVED = frozenset(
@@ -118,7 +96,6 @@ class ClientProfile:
     people_tier_order: list[dict[str, Any]] = field(default_factory=list)
     people_dropped_tiers: list[str] = field(default_factory=list)
     people_measured_rates: dict[str, Any] = field(default_factory=dict)
-    serp_styles: list[str] = field(default_factory=lambda: list(DEFAULT_SERP_STYLES))
     discolike_icp_text: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -159,7 +136,6 @@ class ClientProfile:
             "people_tier_order": list(self.people_tier_order),
             "people_dropped_tiers": list(self.people_dropped_tiers),
             "people_measured_rates": dict(self.people_measured_rates),
-            "serp_styles": list(self.serp_styles),
             "discolike_icp_text": self.discolike_icp_text,
             "domain_tier_order": list(self.domain_tier_order),
             "contacts_table": f"public.{self.contacts_table}",
@@ -188,7 +164,6 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
         people_tier_order=_people_tier_order(doc),
         people_dropped_tiers=_people_dropped_tiers(doc),
         people_measured_rates=_people_measured_rates(doc),
-        serp_styles=normalize_serp_styles(doc.get("serp_styles")),
         discolike_icp_text=str(doc.get("discolike_icp_text") or "").strip(),
         raw=doc,
     )
@@ -211,7 +186,7 @@ def _people_dropped_tiers(doc: dict[str, Any]) -> list[str]:
         return [
             t
             for t in _as_list(doc.get("people_dropped_tiers"))
-            if t in PUBLISHED or t in SERP_STYLE_TIERS
+            if t in PUBLISHED
         ]
     # Domain receipts drop cache/aiark/leadmagic for domain search.
     # Those names are people-finder tiers here — do not inherit them.
@@ -358,7 +333,6 @@ def get_profile(client_tag: str) -> ClientProfile:
         "people_tier_order",
         "people_dropped_tiers",
         "people_measured_rates",
-        "serp_styles",
         "discolike_icp_text",
     ):
         if key in row and row[key] not in (None, "", [], {}):

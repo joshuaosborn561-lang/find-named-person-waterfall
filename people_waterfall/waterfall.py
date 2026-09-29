@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import config as cfg
 from .geo import apply_person_geo
 from .handoff import handoff_title_matches
 from .people import PersonHit, company_matches, conversational_company, looks_like_person
@@ -37,24 +35,10 @@ from .source import (
     writeback_people,
 )
 from .titles import audit_title
-from .vendors.ai_ark import AiArkClient
-from .vendors.ai_ark import per_credit_from_payload as ark_per_credit
 from .vendors.cache import CacheClient
 from .vendors.discolike import DiscoLikeClient
-from .vendors.getleads import GetLeadsClient
 from .vendors.leadmagic import LeadMagicClient
 from .vendors.leadmagic import per_credit_from_payload as lm_per_credit
-from .vendors.prospeo import ProspeoClient
-from .vendors.prospeo import per_credit_from_payload as prospeo_per_credit
-from .vendors.serp import (
-    SerpClient,
-    SerpQuery,
-    build_style_query,
-    enabled_serp_styles,
-    style_applies,
-    style_key,
-)
-from .vendors.smartlead import SmartleadClient
 from .write import (
     contact_payload,
     is_known,
@@ -69,24 +53,13 @@ ProgressFn = Callable[[dict[str, Any]], None]
 @dataclass
 class VendorBundle:
     cache: CacheClient
-    getleads: GetLeadsClient
-    smartlead: SmartleadClient
     leadmagic: LeadMagicClient
-    aiark: AiArkClient
-    serp: SerpClient
-    prospeo: ProspeoClient
     discolike: DiscoLikeClient
 
     def for_tier(self, tier: str) -> Any:
         return {
             "cache": self.cache,
-            "getleads": self.getleads,
-            "smartlead": self.smartlead,
             "leadmagic_employee": self.leadmagic,
-            "leadmagic_role": self.leadmagic,
-            "aiark": self.aiark,
-            "serp": self.serp,
-            "prospeo": self.prospeo,
             "discolike": self.discolike,
         }.get(tier)
 
@@ -94,24 +67,13 @@ class VendorBundle:
 def build_vendors() -> VendorBundle:
     return VendorBundle(
         cache=CacheClient(),
-        getleads=GetLeadsClient(),
-        smartlead=SmartleadClient(),
         leadmagic=LeadMagicClient(),
-        aiark=AiArkClient(),
-        serp=SerpClient(),
-        prospeo=ProspeoClient(),
         discolike=DiscoLikeClient(),
     )
 
 
-def read_live_rates(
-    vendors: VendorBundle,
-    *,
-    probe_search: bool = False,
-    stored_search_free: bool | None = None,
-) -> LiveRates:
+def read_live_rates(vendors: VendorBundle) -> LiveRates:
     rates = LiveRates()
-    rates.leadmagic_search_free = stored_search_free
     if vendors.leadmagic.enabled:
         payload = vendors.leadmagic.credits()
         rates.leadmagic_credits = None
@@ -126,29 +88,6 @@ def read_live_rates(
         if rates.leadmagic_per_credit is None:
             rates.leadmagic_per_credit = 0.0198
             rates.notes.append("leadmagic per-credit defaulted to Essential midpoint")
-        if probe_search and stored_search_free is None:
-            probe = vendors.leadmagic.probe_search_free()
-            rates.leadmagic_search_free = probe
-            if probe is True:
-                rates.notes.append("leadmagic role/search billed 0 credits on a miss probe")
-            elif probe is False:
-                rates.notes.append("leadmagic role-finder spent credits on the probe")
-            else:
-                rates.notes.append("leadmagic search-free probe inconclusive")
-    if vendors.aiark.enabled:
-        payload = vendors.aiark.credits()
-        per, credits = ark_per_credit(payload)
-        rates.aiark_per_credit = per or 0.0049
-        rates.aiark_credits = credits
-        if per is None:
-            rates.notes.append("aiark per-credit defaulted to published high end")
-    if vendors.prospeo.enabled:
-        payload = vendors.prospeo.credits()
-        per, credits = prospeo_per_credit(payload)
-        rates.prospeo_per_credit = per or 0.023
-        rates.prospeo_credits = credits
-    if vendors.smartlead.enabled:
-        vendors.smartlead.refresh_credits()
     return rates
 
 
@@ -178,12 +117,6 @@ def _call_tier(
     }
     if tier == "leadmagic_employee":
         return vendors.leadmagic.employee_finder(**kwargs)
-    if tier == "leadmagic_role":
-        return vendors.leadmagic.find_people_by_role(**kwargs)
-    if tier == "smartlead":
-        return vendors.smartlead.find_people(
-            **kwargs, first_name=first_name, last_name=last_name
-        )
     return client.find_people(**kwargs)
 
 
@@ -191,22 +124,16 @@ def _lane_order(
     allowed: list[str],
     order: list[dict[str, Any]],
     lane: str,
-    company_name: str,
 ) -> list[str]:
-    """SERP is company+title search. Include it whenever it is allowed and
-    the row has a company name, even on the domain lane.
-
-    min_tier / max_tier can name a tier that is not in the default order.
-    Use PUBLISHED.needs so those opt-in tiers still land on the right lane.
+    """min_tier / max_tier can name a tier that is not in the default order.
+    Use PUBLISHED.needs so those windows still land on the right lane.
     """
     known = {row["tier"]: row for row in order}
     out: list[str] = []
     for tier in allowed:
         meta = known.get(tier) or PUBLISHED.get(tier) or {}
         needs = meta.get("needs")
-        if tier == "serp" and company_name:
-            out.append(tier)
-        elif lane == "domain" and needs in {"domain", "either"}:
+        if lane == "domain" and needs in {"domain", "either"}:
             out.append(tier)
         elif lane == "name" and needs in {"name", "either"}:
             out.append(tier)
@@ -226,13 +153,6 @@ def _meta_for(order: list[dict[str, Any]], tier: str, rates: LiveRates) -> dict[
     }
 
 
-def _split_lane(lane_order: list[str]) -> tuple[list[str], bool, list[str]]:
-    if "serp" not in lane_order:
-        return list(lane_order), False, []
-    idx = lane_order.index("serp")
-    return lane_order[:idx], True, lane_order[idx + 1 :]
-
-
 @dataclass
 class _CompanyWork:
     row: dict[str, Any]
@@ -244,7 +164,6 @@ class _CompanyWork:
     last: str
     lane_order: list[str]
     before: list[str]
-    has_serp: bool
     after: list[str]
     accepted_rows: list[dict[str, Any]] = field(default_factory=list)
     bank_count: int = 0
@@ -332,8 +251,6 @@ def estimate_job(
     for name in tiers:
         row = by_name.get(name)
         if row is None:
-            from .pricing import PUBLISHED
-
             meta = PUBLISHED.get(name) or {}
             row = {
                 "tier": name,
@@ -350,9 +267,6 @@ def estimate_job(
         elif billing == "free_on_miss":
             rate = row.get("measured_rate")
             cost = unit * rows * (rate if rate is not None else 0.5)
-        elif row["tier"] == "serp":
-            n_styles = len(enabled_serp_styles(profile))
-            cost = unit * rows * n_styles
         elif row["tier"] == "discolike":
             priced_rows = count_source_with_domain(src)
             cost = unit * priced_rows
@@ -382,9 +296,6 @@ def estimate_job(
             "leadmagic_per_credit": rates.leadmagic_per_credit,
             "leadmagic_credits": rates.leadmagic_credits,
             "leadmagic_plan": rates.leadmagic_plan,
-            "leadmagic_search_free": rates.leadmagic_search_free,
-            "aiark_per_credit": rates.aiark_per_credit,
-            "prospeo_per_credit": rates.prospeo_per_credit,
             "notes": rates.notes,
         },
         "tier_order": order,
@@ -410,15 +321,7 @@ def resolve_people(
     profile = get_profile(tag)
     src = parse_source(source_table, where, writeback=write_supabase)
     bundle = vendors or build_vendors()
-    stored_free = profile.raw.get("leadmagic_search_free")
-    if stored_free is None and isinstance(
-        profile.people_measured_rates.get("leadmagic_search_free"), bool
-    ):
-        stored_free = profile.people_measured_rates.get("leadmagic_search_free")
-    rates = read_live_rates(
-        bundle,
-        stored_search_free=stored_free if isinstance(stored_free, bool) else None,
-    )
+    rates = read_live_rates(bundle)
     order = compute_tier_order(
         rates=rates,
         measured_rates=profile.people_measured_rates,
@@ -459,12 +362,6 @@ def resolve_people(
         "next_tier": None,
         "per_tier": {t: {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0} for t in allowed},
     }
-    if "serp" in allowed:
-        for letter in enabled_serp_styles(profile):
-            stats["per_tier"].setdefault(
-                style_key(letter),
-                {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0},
-            )
     deferred = False
     next_tier = None
 
@@ -488,7 +385,6 @@ def resolve_people(
                 }
             )
 
-    write_lock = threading.Lock()
     emit("running")
 
     def _tier_stat(key: str) -> dict[str, Any]:
@@ -503,30 +399,21 @@ def resolve_people(
         unit: float,
         billing: str,
         cost_override: float | None = None,
-        style: str | None = None,
     ) -> float:
         nonlocal spent
         if cost_override is not None:
             cost = cost_override
         elif billing == "always":
-            if tier == "serp":
-                cost = unit
-            elif tier == "leadmagic_employee":
+            if tier == "leadmagic_employee":
                 cost = unit * max(len(people), 0)
-            elif tier == "aiark":
-                cost = unit * len(people)
             else:
                 cost = unit * max(len(people), 1 if people else 0)
         elif billing == "free_on_miss" and people:
-            cost = unit * (1 if tier == "prospeo" else len(people))
-            if getattr(bundle.prospeo, "last_free", False) and tier == "prospeo":
-                cost = 0.0
+            cost = unit * len(people)
         else:
             cost = 0.0
         spent += cost
         _tier_stat(tier)["usd"] += cost
-        if style:
-            _tier_stat(style_key(style))["usd"] += cost
         stats["spent_usd"] = spent
         return cost
 
@@ -539,7 +426,7 @@ def resolve_people(
         fallback: bool,
         source: str | None = None,
     ) -> None:
-        src = source or tier
+        src_name = source or tier
         hits, bank = _audit_people(
             people,
             profile=profile,
@@ -553,7 +440,7 @@ def resolve_people(
                     client_tag=tag,
                     domain=work.domain,
                     person=person,
-                    source=src,
+                    source=src_name,
                 )
             work.bank_count += 1
             stats["name_bank"] += 1
@@ -561,10 +448,10 @@ def resolve_people(
             if is_known(known, work.domain, person):
                 continue
             known.add(((work.domain or person.domain or ""), person.name_key))
-            work.last_source = src
+            work.last_source = src_name
             _tier_stat(tier)["title_matched"] += 1
-            if src != tier:
-                _tier_stat(src)["title_matched"] += 1
+            if src_name != tier:
+                _tier_stat(src_name)["title_matched"] += 1
             stats["title_matched"] += 1
             if require_title_match or audit.title_match:
                 work.accepted_rows.append(
@@ -574,7 +461,7 @@ def resolve_people(
                         client_tag=tag,
                         company_name=work.company,
                         domain=work.domain,
-                        source_tier=src,
+                        source_tier=src_name,
                         source_confidence=conf,
                     )
                 )
@@ -593,7 +480,7 @@ def resolve_people(
 
     def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
         for tier in tiers:
-            if tier in {"serp", "discolike"}:
+            if tier == "discolike":
                 continue
             meta = _meta_for(order, tier, rates)
             unit = float(meta.get("unit_usd") or 0)
@@ -621,106 +508,6 @@ def resolve_people(
                 if deferred:
                     work.deferred = True
                 return
-
-    def run_serp_batch(
-        works: list[_CompanyWork],
-        titles: list[str],
-        fallback: bool,
-        on_each: Callable[[_CompanyWork, Any], None],
-        *,
-        style: str = "a",
-    ) -> None:
-        """Run one style + title-set batch. on_each fires as each company lands."""
-        if not works:
-            return
-        if not bundle.serp.enabled:
-            for work in works:
-                on_each(work, None)
-            return
-        meta = _meta_for(order, "serp", rates)
-        unit = float(meta.get("unit_usd") or 0)
-        billing = meta.get("billing") or "always"
-        jobs: list[SerpQuery] = []
-        work_by_key: dict[str, _CompanyWork] = {}
-        pending = list(works)
-        letter = (style or "a").strip().lower().removeprefix("serp_")
-        src = style_key(letter)
-        for idx, work in enumerate(pending):
-            if not style_applies(
-                letter,
-                company_name=work.company,
-                domain=work.domain,
-                city=work.city,
-            ):
-                on_each(work, None)
-                continue
-            query = build_style_query(
-                letter,
-                company_name=work.company,
-                domain=work.domain,
-                city=work.city,
-                titles=titles,
-            )
-            if not query:
-                on_each(work, None)
-                continue
-            if _would_defer("serp", unit, billing):
-                work.deferred = True
-                on_each(work, None)
-                for rest in pending[idx + 1 :]:
-                    rest.deferred = True
-                    on_each(rest, None)
-                return
-            key = str(work.row.get("_source_key") or id(work))
-            work_by_key[key] = work
-            jobs.append(
-                SerpQuery(
-                    key=key,
-                    query=query,
-                    company_name=work.company,
-                    titles=list(titles),
-                    style=letter,
-                    domain=work.domain,
-                    city=work.city,
-                )
-            )
-        if not jobs:
-            return
-        emit("serp")
-
-        def on_chunk(packed: list[Any]) -> None:
-            with write_lock:
-                for item in packed:
-                    work = work_by_key.get(getattr(item, "key", ""))
-                    if work is None:
-                        continue
-                    people = list(getattr(item, "people", None) or [])
-                    cost = float(getattr(item, "cost_usd", 0) or 0)
-                    item_style = str(getattr(item, "style", letter) or letter)
-                    item_src = style_key(item_style)
-                    _tier_stat("serp")["calls"] += 1
-                    _tier_stat("serp")["people"] += len(people)
-                    _tier_stat(item_src)["calls"] += 1
-                    _tier_stat(item_src)["people"] += len(people)
-                    _bill(
-                        "serp",
-                        people,
-                        unit=unit,
-                        billing=billing,
-                        cost_override=cost,
-                        style=item_style,
-                    )
-                    _apply_people(
-                        work,
-                        "serp",
-                        people,
-                        titles=titles,
-                        fallback=fallback,
-                        source=item_src,
-                    )
-                    on_each(work, item)
-
-        bundle.serp.resolve_queries(jobs, profile=profile, unit=unit, on_chunk=on_chunk)
 
     def run_discolike_batch(works: list[_CompanyWork]) -> None:
         if not works:
@@ -837,7 +624,6 @@ def resolve_people(
             finalize(work)
 
     pending_disco: list[_CompanyWork] = []
-    pending_serp: list[_CompanyWork] = []
     pending_after: list[_CompanyWork] = []
     target_titles = list(profile.target_titles)
     fallback_titles = list(profile.fallback_titles)
@@ -850,16 +636,14 @@ def resolve_people(
         first = str(row.get("first_name") or "").strip()
         last = str(row.get("last_name") or "").strip()
         lane = "domain" if domain else "name"
-        lane_order = _lane_order(allowed, order, lane, company)
-        first_batch = next((t for t in lane_order if t in {"discolike", "serp"}), "")
-        if first_batch:
-            idx = lane_order.index(first_batch)
+        lane_order = _lane_order(allowed, order, lane)
+        if "discolike" in lane_order:
+            idx = lane_order.index("discolike")
             before, rest = lane_order[:idx], lane_order[idx:]
         else:
             before, rest = list(lane_order), []
         has_disco = "discolike" in rest or "discolike" in lane_order
-        has_serp = "serp" in rest
-        after = [t for t in rest if t not in {"discolike", "serp"}]
+        after = [t for t in rest if t != "discolike"]
         work = _CompanyWork(
             row=row,
             domain=domain,
@@ -870,7 +654,6 @@ def resolve_people(
             last=last,
             lane_order=lane_order,
             before=before,
-            has_serp=has_serp,
             after=after,
         )
         run_pass(work, work.before, target_titles, False)
@@ -882,18 +665,12 @@ def resolve_people(
         if has_disco:
             if not work.domain:
                 work.reason = "no_domain"
-                if work.has_serp:
-                    pending_serp.append(work)
-                    continue
                 if work.after:
                     pending_after.append(work)
                     continue
                 finalize(work)
                 continue
             pending_disco.append(work)
-            continue
-        if work.has_serp:
-            pending_serp.append(work)
             continue
         if work.after:
             pending_after.append(work)
@@ -914,9 +691,6 @@ def resolve_people(
             if work.accepted_rows or work.deferred:
                 finalize(work)
                 continue
-            if work.has_serp:
-                pending_serp.append(work)
-                continue
             if work.after:
                 pending_after.append(work)
                 continue
@@ -931,67 +705,6 @@ def resolve_people(
                 )
                 break
         finalize_rest(pending_disco)
-
-    def _serp_open(works: list[_CompanyWork]) -> list[_CompanyWork]:
-        return [
-            work
-            for work in works
-            if not work.accepted_rows
-            and not work.deferred
-            and not work.row.get("_finalized")
-        ]
-
-    if pending_serp:
-        emit("serp")
-        styles = enabled_serp_styles(profile)
-        fallback_serp: list[_CompanyWork] = []
-
-        def after_a_target(work: _CompanyWork, item: Any) -> None:
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-                return
-            company_matched = int(getattr(item, "company_matched", 0) or 0) if item else 0
-            if company_matched:
-                return
-            if fallback_titles:
-                work.used_fallback = True
-                fallback_serp.append(work)
-
-        def after_style(work: _CompanyWork, item: Any) -> None:
-            if work.accepted_rows or work.deferred:
-                finalize(work)
-
-        if "a" in styles:
-            run_serp_batch(pending_serp, target_titles, False, after_a_target, style="a")
-            still_fallback = _serp_open(fallback_serp)
-            if still_fallback and not deferred:
-                run_serp_batch(
-                    still_fallback, fallback_titles, True, after_style, style="a"
-                )
-            elif still_fallback:
-                finalize_rest(still_fallback, as_deferred=True)
-
-        for letter in styles:
-            if letter == "a" or deferred:
-                continue
-            still = _serp_open(pending_serp)
-            if not still:
-                break
-            run_serp_batch(still, target_titles, False, after_style, style=letter)
-
-        leftover = _serp_open(pending_serp)
-        if leftover and not deferred:
-            for i, work in enumerate(leftover):
-                titles = fallback_titles if work.used_fallback else target_titles
-                if work.after:
-                    run_pass(work, work.after, titles, work.used_fallback)
-                finalize(work)
-                if deferred:
-                    finalize_rest(leftover[i + 1 :], as_deferred=True)
-                    break
-        elif leftover:
-            finalize_rest(leftover, as_deferred=True)
-        finalize_rest(pending_serp)
 
     if pending_after and not deferred:
         for i, work in enumerate(pending_after):
@@ -1042,14 +755,11 @@ def resolve_people(
         "skip_tiers": skipped,
         "selected_tiers": list(allowed),
         "per_tier": stats["per_tier"],
-        "serp_actor_runs": int(getattr(bundle.serp, "runs", 0) or 0),
         "tier_order": order,
         "live_rates": {
             "leadmagic_per_credit": rates.leadmagic_per_credit,
             "leadmagic_credits": rates.leadmagic_credits,
             "leadmagic_plan": rates.leadmagic_plan,
-            "leadmagic_search_free": rates.leadmagic_search_free,
-            "aiark_per_credit": rates.aiark_per_credit,
             "notes": rates.notes,
         },
         "handoff": handoff,

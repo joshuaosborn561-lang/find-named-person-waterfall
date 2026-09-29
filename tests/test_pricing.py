@@ -1,10 +1,10 @@
 from people_waterfall.pricing import (
     DEFAULT_ORDER,
+    PUBLISHED,
     LiveRates,
     compute_tier_order,
     include_from_profile,
     select_tiers,
-    sort_key,
 )
 
 
@@ -14,12 +14,7 @@ def test_default_order_is_cache_discolike_leadmagic_employee():
     names = [r["tier"] for r in order if not r["dropped"]]
     assert names == ["cache", "discolike", "leadmagic_employee"]
     assert DEFAULT_ORDER == ["cache", "discolike", "leadmagic_employee"]
-    assert "getleads" not in names
-    assert "serp" not in names
-    assert "aiark" not in names
-    assert "prospeo" not in names
-    assert "smartlead" not in names
-    assert "leadmagic_role" not in names
+    assert set(PUBLISHED) == {"cache", "discolike", "leadmagic_employee"}
 
 
 def test_discolike_unit_is_serper_times_two_plus_company_fee(monkeypatch):
@@ -29,30 +24,14 @@ def test_discolike_unit_is_serper_times_two_plus_company_fee(monkeypatch):
     assert rates.unit_usd("discolike") == 0.0055
 
 
-def test_explicit_people_tier_order_opts_serp_back_in():
+def test_unknown_tiers_are_ignored_in_people_tier_order():
     rates = LiveRates()
     include = include_from_profile(
         [{"tier": "cache"}, {"tier": "serp"}, {"tier": "discolike"}]
     )
     order = compute_tier_order(rates=rates, include=include)
     names = [r["tier"] for r in order if not r["dropped"]]
-    assert names == ["cache", "serp", "discolike"]
-
-
-def test_search_free_moves_role_finder_with_free_tier():
-    rates = LiveRates(leadmagic_search_free=True, leadmagic_per_credit=0.0198)
-    order = compute_tier_order(
-        rates=rates, include=["cache", "leadmagic_role", "discolike"]
-    )
-    role = next(r for r in order if r["tier"] == "leadmagic_role")
-    assert role["billing"] == "free"
-    assert role["unit_usd"] == 0.0
-
-
-def test_free_on_miss_uses_half_rate_until_measured():
-    rates = LiveRates(prospeo_per_credit=0.02)
-    key = sort_key("prospeo", rates=rates, measured_rate=None, dropped=set())
-    assert key[1] == rates.unit_usd("prospeo") * 0.5
+    assert names == ["cache", "discolike"]
 
 
 def test_zero_yield_dropped_not_reordered():
@@ -67,11 +46,11 @@ def test_zero_yield_dropped_not_reordered():
     assert names == ["cache", "leadmagic_employee"]
 
 
-def test_select_tiers_can_run_serp_alone():
+def test_select_tiers_can_run_discolike_alone():
     rates = LiveRates(leadmagic_per_credit=0.01)
     order = compute_tier_order(rates=rates)
-    names = select_tiers(order, min_tier="serp", max_tier="serp")
-    assert names == ["serp"]
+    names = select_tiers(order, min_tier="discolike", max_tier="discolike")
+    assert names == ["discolike"]
 
 
 def test_skip_tiers_drops_leadmagic_employee():
@@ -82,8 +61,10 @@ def test_skip_tiers_drops_leadmagic_employee():
     assert names == ["cache", "discolike"]
 
 
-def test_min_tier_can_include_a_dropped_serp():
+def test_min_tier_can_include_a_dropped_discolike():
     rates = LiveRates()
-    order = compute_tier_order(rates=rates, dropped_tiers=["serp"])
-    assert "serp" not in select_tiers(order)
-    assert select_tiers(order, min_tier="serp", max_tier="serp") == ["serp"]
+    order = compute_tier_order(rates=rates, dropped_tiers=["discolike"])
+    assert "discolike" not in select_tiers(order)
+    assert select_tiers(order, min_tier="discolike", max_tier="discolike") == [
+        "discolike"
+    ]

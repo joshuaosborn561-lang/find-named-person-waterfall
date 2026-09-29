@@ -36,10 +36,6 @@ class _Empty:
     def employee_finder(self, **kwargs):
         return []
 
-    def find_people_by_role(self, **kwargs):
-        return []
-
-
 class _Disco:
     enabled = True
     calls = 0
@@ -84,12 +80,7 @@ class _Disco:
 def _bundle(disco=None) -> VendorBundle:
     return VendorBundle(
         cache=_Empty(),
-        getleads=_Empty(),
-        smartlead=_Empty(),
         leadmagic=_Empty(),
-        aiark=_Empty(),
-        serp=_Empty(),
-        prospeo=_Empty(),
         discolike=disco or _Disco(),
     )
 
