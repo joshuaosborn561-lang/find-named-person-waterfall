@@ -11,7 +11,7 @@ from . import supabase_sync
 from .config import settings
 from .pricing import PUBLISHED
 
-PEOPLE_TIER_NAMES = frozenset(PUBLISHED) | {"leadmagic_search_free"}
+PEOPLE_TIER_NAMES = frozenset(PUBLISHED)
 
 _TAG_RE = re.compile(r"^[a-z][a-z0-9_]{0,46}$")
 RESERVED = frozenset(
@@ -96,6 +96,7 @@ class ClientProfile:
     people_tier_order: list[dict[str, Any]] = field(default_factory=list)
     people_dropped_tiers: list[str] = field(default_factory=list)
     people_measured_rates: dict[str, Any] = field(default_factory=dict)
+    discolike_icp_text: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     # Domain Waterfall owns these shared keys. Kept for display only.
@@ -135,6 +136,7 @@ class ClientProfile:
             "people_tier_order": list(self.people_tier_order),
             "people_dropped_tiers": list(self.people_dropped_tiers),
             "people_measured_rates": dict(self.people_measured_rates),
+            "discolike_icp_text": self.discolike_icp_text,
             "domain_tier_order": list(self.domain_tier_order),
             "contacts_table": f"public.{self.contacts_table}",
         }
@@ -162,6 +164,7 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
         people_tier_order=_people_tier_order(doc),
         people_dropped_tiers=_people_dropped_tiers(doc),
         people_measured_rates=_people_measured_rates(doc),
+        discolike_icp_text=str(doc.get("discolike_icp_text") or "").strip(),
         raw=doc,
     )
 
@@ -198,6 +201,93 @@ def _people_measured_rates(doc: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(shared, dict):
         return {}
     return {k: v for k, v in shared.items() if k in PEOPLE_TIER_NAMES}
+
+
+def build_discolike_icp(profile: ClientProfile) -> str:
+    stored = (profile.discolike_icp_text or "").strip()
+    if stored:
+        return stored
+    titles = [t for t in (profile.target_titles or []) if t]
+    if titles:
+        if len(titles) == 1:
+            title_line = f"Find the {titles[0]}."
+        else:
+            title_line = "Find the " + ", ".join(titles[:-1]) + f", or {titles[-1]}."
+    else:
+        title_line = "Find decision-makers."
+    vertical = str(
+        profile.raw.get("discolike_vertical")
+        or profile.raw.get("vertical")
+        or profile.raw.get("industry")
+        or (profile.geo or {}).get("vertical")
+        or ""
+    ).strip()
+    if vertical:
+        return f"{title_line}\nVertical: {vertical}."
+    return title_line
+
+
+def persist_discolike_icp(client_tag: str, text: str) -> None:
+    tag = normalize_client_tag(client_tag)
+    text = (text or "").strip()
+    if not text:
+        return
+    rows = supabase_sync.rest_select(
+        "wf_client_profiles",
+        params={"client_tag": f"eq.{tag}", "select": "profile"},
+    )
+    doc: dict[str, Any] = {}
+    if rows:
+        raw = rows[0].get("profile")
+        if isinstance(raw, dict):
+            doc = dict(raw)
+        elif isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    doc = parsed
+            except ValueError:
+                doc = {}
+    doc["discolike_icp_text"] = text
+    supabase_sync.rest_patch(
+        "wf_client_profiles",
+        params={"client_tag": f"eq.{tag}"},
+        body={"profile": doc},
+    )
+
+
+def merge_people_measured_rates(client_tag: str, measured: dict[str, Any]) -> None:
+    """Merge per-tier hit rates after a job. Do not rewrite people_tier_order."""
+    tag = normalize_client_tag(client_tag)
+    rows = supabase_sync.rest_select(
+        "wf_client_profiles",
+        params={"client_tag": f"eq.{tag}", "select": "profile,people_measured_rates"},
+    )
+    doc: dict[str, Any] = {}
+    current: dict[str, Any] = {}
+    if rows:
+        raw = rows[0].get("profile")
+        if isinstance(raw, dict):
+            doc = dict(raw)
+        elif isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    doc = parsed
+            except ValueError:
+                doc = {}
+        existing = rows[0].get("people_measured_rates")
+        if isinstance(existing, dict):
+            current.update(existing)
+        elif isinstance(doc.get("people_measured_rates"), dict):
+            current.update(doc["people_measured_rates"])
+    current.update(measured)
+    doc["people_measured_rates"] = current
+    supabase_sync.rest_patch(
+        "wf_client_profiles",
+        params={"client_tag": f"eq.{tag}"},
+        body={"people_measured_rates": current, "profile": doc},
+    )
 
 
 def get_profile(client_tag: str) -> ClientProfile:
@@ -243,6 +333,7 @@ def get_profile(client_tag: str) -> ClientProfile:
         "people_tier_order",
         "people_dropped_tiers",
         "people_measured_rates",
+        "discolike_icp_text",
     ):
         if key in row and row[key] not in (None, "", [], {}):
             merged[key] = row[key]

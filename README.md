@@ -12,7 +12,7 @@ size bands, ground truth, and cache tables come from
 
 | Tool | Purpose |
 | --- | --- |
-| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. `min_tier` / `skip_tiers` can isolate SERP. |
+| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. `min_tier` / `skip_tiers` window the cache → discolike → leadmagic_employee order. |
 | `receipt_test` | Score every people tier on ground truth. Write `people_tier_order`. |
 | `get_profile` | Read-only. Profiles are created by Domain Waterfall `ensure_profile`. |
 | `get_job_status` | Last known progress plus `counter` (`done`/`total`/`pct`). Never a bare error. |
@@ -20,12 +20,11 @@ size bands, ground truth, and cache tables come from
 
 ## Ordering
 
-Cheapest to most expensive, always. Free tiers first. Paid tiers sort on the
-account's live unit price at job start. Free-on-miss sorts on price × measured
-hit rate (default half until a receipt measures it). A receipt may drop a
-zero-yield people tier; it does not change the sort rule. People Waterfall
-writes `people_tier_order` / `people_dropped_tiers` / `people_measured_rates`.
-It never reads or writes the domain resolver's shared `tier_order`.
+Default people-tier order is cache → discolike → leadmagic_employee.
+A receipt may drop a zero-yield people tier; it does not reorder the
+declared list. People Waterfall writes `people_tier_order` /
+`people_dropped_tiers` / `people_measured_rates`. It never reads or
+writes the domain resolver's shared `tier_order`.
 
 ## Writes
 

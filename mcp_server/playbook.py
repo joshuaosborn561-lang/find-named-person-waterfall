@@ -1,8 +1,8 @@
 INSTRUCTIONS = """# People Waterfall MCP
 
 Given a company, return named people whose title is one the client asked for.
-This service never finds an email. Title-matched rows are handed to the existing
-Email Finder Waterfall in `name_company` mode.
+This service does not buy emails. Title-matched rows are handed to the
+existing Email Finder Waterfall in `name_company` mode.
 
 Nothing industry-specific lives in code. Titles, synonyms, geography, company
 size bands, ground truth, and cache tables come from `public.wf_client_profiles`,
@@ -15,19 +15,13 @@ Waterfall `ensure_profile` creates the row.
   This is the job runner. Source is `source_table` + `where`, paged 500
   server side. No inline rows. `estimate_only=true` first on any paid run.
   Free tiers ignore the cost ceiling. `min_tier`/`max_tier` window the
-  people-tier order. `skip_tiers` is a comma list. SERP-only:
-  `min_tier=serp` `max_tier=serp`. SERP query is
-  `site:linkedin.com/in "{company}" ("Owner" OR ...target_titles)`.
-  SERP batches up to 100 queries per Apify run and starts 2 runs at a
-  time; cost is still $0.0045 per query, not per run. The target_titles
-  query is sent first for every company. fallback_titles is queued only
-  when that target query returned no personalInfo.companyName match.
+  people-tier order. `skip_tiers` is a comma list.
+  DiscoLike-only: `min_tier=discolike` `max_tier=discolike`.
   Zero-pass companies are written wf_people_status=people_unresolved.
-  counter.done advances when a company is processed and written, not
-  when its query is submitted.
+  counter.done advances when a company is processed and written.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
-  prices, drops zero-yield people tiers, writes `people_tier_order`.
-  Never writes the domain resolver's shared `tier_order`.
+  prices, drops zero-yield people tiers, writes `people_tier_order`. Never
+  writes the domain resolver's shared `tier_order`.
 - `get_profile(client_tag)`
 - `get_job_status(job_id)` — last known progress, never a bare error.
   Always includes `counter`: done / total / remaining / pct plus a
@@ -36,9 +30,23 @@ Waterfall `ensure_profile` creates the row.
 
 ## Ordering
 
-Cheapest to most expensive, always. Free first, then paid sorted by live unit
-price per person. Free-on-miss sorts on price × measured hit rate (default 0.5).
-A receipt does not reorder that rule; it only drops a zero-yield tier.
+Default people_tier_order is cache → discolike → leadmagic_employee.
+Those are the only people tiers. A receipt may drop a zero-yield
+default tier; it does not cheapest-sort the declared order.
+
+DiscoLike is the primary discovery tier. It needs a domain. One sequential
+task for the full domain list (cap 5,000; more domains run as later
+tasks, never concurrent). search_context_size=low (2 queries),
+max_contacts_per_domain=3, find_emails=false, integration_id=native.
+icp_text comes from profile.discolike_icp_text (generated from
+target_titles + vertical on first run). Cost is
+SERPER_USD_PER_QUERY × 2 + DISCOLIKE_USD_PER_COMPANY (defaults
+0.001 and 0.0035). estimate_only prices rows_with_domain × unit.
+No-domain rows skip this tier and are marked people_unresolved
+with reason no_domain. Email pattern lands on the source row as
+wf_email_pattern / wf_email_pattern_conf. After a job, title-matched
+rows are handed to Email Finder Waterfall; the handoff calls
+ensure_client first so public.{tag}_wf_contacts exists.
 
 ## Write rules
 

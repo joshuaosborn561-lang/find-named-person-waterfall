@@ -1,14 +1,12 @@
-"""Live unit prices and cheapest-to-most-expensive sort.
+"""Live unit prices for the people-tier list.
 
-Always-billed tiers sort on unit price per person.
-Free-on-miss tiers sort on unit price times measured hit rate
-(default half the unit price until a receipt measures it).
-Ties break on measured rate. Free tiers stay first.
-A receipt may drop a zero-yield tier; it never reorders the rule.
+Default order is cache → discolike → leadmagic_employee. A receipt may
+drop a zero-yield tier; it never reorders the declared sequence.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,18 +20,10 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "unit_usd": 0.0,
         "receipt_lanes": ("domain", "name"),
     },
-    "getleads": {
+    "discolike": {
         "needs": "domain",
-        "billing": "free",
+        "billing": "always",
         "credits": 0.0,
-        "unit_usd": 0.0,
-        "receipt_lanes": ("domain",),
-    },
-    "smartlead": {
-        "needs": "domain",
-        "billing": "free",
-        "credits": 0.0,
-        "unit_usd": 0.0,
         "receipt_lanes": ("domain",),
     },
     "leadmagic_employee": {
@@ -44,42 +34,6 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "unit_usd_high": 0.0012,
         "receipt_lanes": ("domain",),
     },
-    "aiark": {
-        "needs": "either",
-        "billing": "always",
-        "credits": 0.5,
-        "unit_usd_low": 0.001,
-        "unit_usd_high": 0.0049,
-        "receipt_lanes": ("domain", "name"),
-    },
-    "serp": {
-        "needs": "name",
-        "billing": "always",
-        "credits": 0.0,
-        "unit_usd": 0.0045,
-        "unit_usd_per_person": 0.03,
-        "receipt_lanes": ("name",),
-    },
-    "prospeo": {
-        "needs": "either",
-        "billing": "free_on_miss",
-        "credits": 1.0,
-        "unit_usd_low": 0.007,
-        "unit_usd_high": 0.039,
-        "receipt_lanes": ("domain", "name"),
-    },
-    "leadmagic_role": {
-        "needs": "either",
-        "billing": "free_on_miss",
-        # Official POST /v1/people/role-finder: 2 credits/hit, free on miss.
-        # People/Company/Jobs Search on Essential+ spends no credits; a receipt
-        # probe sets leadmagic_search_free and this unit becomes $0.
-        "credits": 2.0,
-        "unit_usd_low": 0.0208,
-        "unit_usd_high": 0.049,
-        "receipt_lanes": ("domain", "name"),
-        "search_may_be_free": True,
-    },
 }
 
 TIER_ALIASES = {
@@ -87,25 +41,16 @@ TIER_ALIASES = {
     "local_cache": "cache",
     "lm_employee": "leadmagic_employee",
     "employee_finder": "leadmagic_employee",
-    "leadmagic": "leadmagic_role",
-    "lm": "leadmagic_role",
-    "find_people_by_role": "leadmagic_role",
-    "search_people": "leadmagic_role",
-    "ai_ark": "aiark",
-    "ark": "aiark",
-    "apify": "serp",
-    "apify_serp": "serp",
+    "leadmagic": "leadmagic_employee",
+    "lm": "leadmagic_employee",
+    "disco": "discolike",
+    "discogen": "discolike",
 }
 
 DEFAULT_ORDER = [
     "cache",
-    "getleads",
-    "smartlead",
+    "discolike",
     "leadmagic_employee",
-    "aiark",
-    "serp",
-    "prospeo",
-    "leadmagic_role",
 ]
 
 
@@ -119,28 +64,27 @@ class LiveRates:
     leadmagic_credits: float | None = None
     leadmagic_plan: str = ""
     leadmagic_per_credit: float | None = None
-    leadmagic_search_free: bool | None = None
-    aiark_per_credit: float | None = None
-    aiark_credits: float | None = None
-    prospeo_per_credit: float | None = None
-    prospeo_credits: float | None = None
     notes: list[str] = field(default_factory=list)
 
     def unit_usd(self, tier: str) -> float:
         meta = PUBLISHED.get(tier) or {}
         if meta.get("billing") == "free":
             return 0.0
-        if tier == "leadmagic_role" and self.leadmagic_search_free:
-            return 0.0
+        if tier == "discolike":
+            try:
+                serper = float(os.environ.get("SERPER_USD_PER_QUERY") or 0.001)
+            except ValueError:
+                serper = 0.001
+            try:
+                company = float(os.environ.get("DISCOLIKE_USD_PER_COMPANY") or 0.0035)
+            except ValueError:
+                company = 0.0035
+            return serper * 2 + company
         if "unit_usd" in meta:
             return float(meta["unit_usd"])
         credits = float(meta.get("credits") or 0)
         if tier.startswith("leadmagic") and self.leadmagic_per_credit is not None:
             return credits * self.leadmagic_per_credit
-        if tier == "aiark" and self.aiark_per_credit is not None:
-            return credits * self.aiark_per_credit
-        if tier == "prospeo" and self.prospeo_per_credit is not None:
-            return credits * self.prospeo_per_credit
         low = meta.get("unit_usd_low")
         high = meta.get("unit_usd_high")
         if low is not None and high is not None:
@@ -160,8 +104,6 @@ def sort_key(
         return (9, 1e9, 0.0)
     meta = PUBLISHED.get(tier) or {}
     billing = str(meta.get("billing") or "always")
-    if tier == "leadmagic_role" and rates.leadmagic_search_free:
-        billing = "free"
     unit = rates.unit_usd(tier)
     rate = measured_rate if measured_rate is not None else 0.5
     if billing == "free":
@@ -188,6 +130,8 @@ def compute_tier_order(
             continue
         seen.add(name)
         names.append(name)
+    # Default (and explicit people_tier_order) keep declared sequence.
+    # Receipt may drop a zero-yield tier; it does not cheapest-sort this list.
 
     def _rate(name: str) -> float | None:
         block = measured.get(name)
@@ -197,17 +141,10 @@ def compute_tier_order(
             return float(block)
         return None
 
-    names.sort(
-        key=lambda t: sort_key(
-            t, rates=rates, measured_rate=_rate(t), dropped=dropped
-        )
-    )
     out: list[dict[str, Any]] = []
     for name in names:
         meta = PUBLISHED[name]
         billing = str(meta.get("billing") or "always")
-        if name == "leadmagic_role" and rates.leadmagic_search_free:
-            billing = "free"
         out.append(
             {
                 "tier": name,
@@ -221,6 +158,25 @@ def compute_tier_order(
             }
         )
     return out
+
+
+def include_from_profile(people_tier_order: list[Any] | None) -> list[str] | None:
+    """Explicit people_tier_order names, else None so DEFAULT_ORDER is used."""
+    if not people_tier_order:
+        return None
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in people_tier_order:
+        if isinstance(row, dict):
+            raw = str(row.get("tier") or "")
+        else:
+            raw = str(row or "")
+        name = normalize_tier(raw)
+        if not name or name in seen or name not in PUBLISHED:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names or None
 
 
 def parse_tier_list(value: str | list[str] | None) -> list[str]:
@@ -252,7 +208,7 @@ def select_tiers(
 
     min_tier / max_tier slice the live order (inclusive). skip_tiers removes
     named tiers. An explicit min or max can include a dropped tier so a job
-    can run serp alone after a receipt dropped it.
+    can run that tier alone after a receipt dropped it.
     """
     skip = set(parse_tier_list(skip_tiers))
     start_raw = (min_tier or "").strip()

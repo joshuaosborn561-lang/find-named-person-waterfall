@@ -24,6 +24,7 @@ CONTACT_COLUMNS = (
     "phone",
     "person_city",
     "person_state",
+    "email",
 )
 FORBIDDEN = ("dl_status", "sg_exclude")
 
@@ -56,6 +57,7 @@ def contact_payload(
         "phone": person.phone or None,
         "person_city": person.person_city or None,
         "person_state": person.person_state or None,
+        "email": person.email or None,
         "client_tag": client_tag,
         "updated_at": _now(),
         # Compatibility aliases on older wf_contacts tables.

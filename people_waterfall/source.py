@@ -10,12 +10,16 @@ from typing import Any
 from . import supabase_sync
 from .config import DEFAULT_SUPABASE_PROJECT
 from .geo import parse_city_state
+from .people import conversational_company
 
 PAGE_SIZE = 500
 PEOPLE_WRITEBACK = (
     "wf_people_count",
     "wf_people_source",
     "wf_people_status",
+    "wf_people_reason",
+    "wf_email_pattern",
+    "wf_email_pattern_conf",
 )
 FORBIDDEN_WRITE = frozenset(
     {
@@ -42,11 +46,15 @@ _PRED = re.compile(
 
 FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "company_name": (
+        "clean_name",
+        "dba",
+        "trade_name",
+        "doing_business_as",
+        "common_name",
+        "conversational_name",
         "company_name",
-        "company",
         "business_name",
         "contractor_name",
-        "clean_name",
         "name",
     ),
     "domain": ("domain", "website"),
@@ -201,7 +209,8 @@ def _map_row(src: TableSource, raw: dict[str, Any]) -> dict[str, Any]:
     for field_name, col in src.column_map.items():
         item[field_name] = raw.get(col)
     item["domain"] = _normalize_domain(str(item.get("domain") or ""))
-    company = str(item.get("company_name") or "").strip()
+    spoken = conversational_company(raw)
+    company = spoken or str(item.get("company_name") or "").strip()
     item["company_name"] = company
     city = str(item.get("city") or "").strip()
     state = str(item.get("state") or "").strip()
@@ -309,6 +318,25 @@ def count_source_exact(src: TableSource) -> int | None:
     return supabase_sync.rest_exact_count(src.table, params=params, schema=src.schema)
 
 
+def _and_where(*parts: str) -> str:
+    bits = [p.strip() for p in parts if (p or "").strip()]
+    return " and ".join(bits)
+
+
+def count_source_with_domain(src: TableSource, cap: int = 50_000) -> int:
+    extra = TableSource(
+        project_id=src.project_id,
+        schema=src.schema,
+        table=src.table,
+        where=_and_where(src.where, "domain is not null"),
+        key_column=src.key_column,
+        column_map=dict(src.column_map),
+        limit=src.limit,
+        writeback=False,
+    )
+    return count_source(extra, cap=cap)
+
+
 def count_source(src: TableSource, cap: int = 50_000) -> int:
     exact = count_source_exact(src)
     if exact is not None:
@@ -342,14 +370,23 @@ def writeback_people(
     count: int,
     source: str,
     status: str,
+    reason: str = "",
+    email_pattern: str = "",
+    email_pattern_confidence: float | None = None,
 ) -> None:
     if not src.writeback or source_key in (None, ""):
         return
-    fields = {
+    fields: dict[str, Any] = {
         "wf_people_count": count,
         "wf_people_source": source,
         "wf_people_status": status,
     }
+    if reason:
+        fields["wf_people_reason"] = reason
+    if email_pattern:
+        fields["wf_email_pattern"] = email_pattern
+    if email_pattern_confidence is not None:
+        fields["wf_email_pattern_conf"] = email_pattern_confidence
     for forbidden in FORBIDDEN_WRITE:
         fields.pop(forbidden, None)
     try:

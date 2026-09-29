@@ -34,6 +34,22 @@ def normalize_name(first: str, last: str = "") -> str:
     return f"{first_n} {last_n}".strip()
 
 
+def name_derived_from_company(
+    first: str, last: str, company_name: str = "", domain: str = ""
+) -> bool:
+    """True when the name is the company/domain mashed into two tokens."""
+    full = re.sub(r"[^a-z0-9]", "", f"{first}{last}".lower())
+    if len(full) < 4:
+        return False
+    company = re.sub(r"[^a-z0-9]", "", (company_name or "").lower())
+    if company and (full in company or company in full):
+        return True
+    host = re.sub(r"[^a-z0-9]", "", ((domain or "").split(".")[0] or "").lower())
+    if host and len(host) >= 4 and (host in full or full in host):
+        return True
+    return False
+
+
 def looks_like_person(first: str, last: str = "") -> bool:
     first = (first or "").strip()
     last = (last or "").strip()
@@ -44,7 +60,24 @@ def looks_like_person(first: str, last: str = "") -> bool:
         return False
     if ENTITY_MARKERS.search(name):
         return False
-    if first.lower() in {"project", "general", "construction", "the", "our"}:
+    if first.lower() in {
+        "project",
+        "general",
+        "construction",
+        "the",
+        "our",
+        "about",
+        "meet",
+        "team",
+        "staff",
+        "leadership",
+        "office",
+        "at",
+        "from",
+        "with",
+    }:
+        return False
+    if last.lower() in {"us", "team", "staff", "llc", "inc"}:
         return False
     if not re.search(r"[A-Za-z]{2,}", first):
         return False
@@ -57,6 +90,46 @@ def looks_like_person(first: str, last: str = "") -> bool:
 def company_prefix(name: str, n: int = 10) -> str:
     raw = re.sub(r"[^a-z0-9]", "", (name or "").lower())
     return raw[:n]
+
+
+def url_host(url: str) -> str:
+    raw = (url or "").strip()
+    m = re.search(r"https?://([^/#?]+)", raw, re.I)
+    host = (m.group(1) if m else "").lower()
+    host = host.split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+LEGAL_COMPANY_KEYS = frozenset(
+    {"legal_name", "registered_name", "entity_name", "legal_company_name"}
+)
+CONVERSATIONAL_COMPANY_KEYS = (
+    "clean_name",
+    "dba",
+    "trade_name",
+    "doing_business_as",
+    "common_name",
+    "conversational_name",
+    "company_name",
+    "business_name",
+    "contractor_name",
+    "name",
+)
+
+
+def conversational_company(row: dict[str, Any]) -> str:
+    """Prefer the spoken/DBA name. Never the legal entity name."""
+    if not isinstance(row, dict):
+        return ""
+    for key in CONVERSATIONAL_COMPANY_KEYS:
+        if key in LEGAL_COMPANY_KEYS:
+            continue
+        val = str(row.get(key) or "").strip()
+        if val:
+            return val
+    return ""
 
 
 def company_matches(
@@ -163,6 +236,7 @@ class PersonHit:
     source_tier: str = ""
     source_confidence: float = 1.0
     is_current: bool | None = None
+    email: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -235,5 +309,6 @@ def person_from_row(row: dict[str, Any], source_tier: str) -> PersonHit | None:
         ),
         source_tier=source_tier,
         is_current=is_current_employment(row),
+        email=str(row.get("email") or row.get("work_email") or "").strip(),
         raw=row,
     )
