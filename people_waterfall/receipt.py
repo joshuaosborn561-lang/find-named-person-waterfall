@@ -5,12 +5,14 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from . import supabase_sync
-from .people import PersonHit, company_matches, looks_like_person
+from .geo import apply_person_geo
+from .people import PersonHit, company_matches, conversational_company, looks_like_person
 from .progress import build_counter
-from .pricing import LiveRates, compute_tier_order, lane_tiers
+from .pricing import LiveRates, compute_tier_order, include_from_profile, lane_tiers
 from .profile import ClientProfile, get_profile, normalize_client_tag, update_profile_metrics
 from .source import where_to_filters
 from .titles import audit_title
+from .vendors.serp import enabled_serp_styles, style_applies, style_key
 from .waterfall import VendorBundle, _call_tier, build_vendors, read_live_rates
 
 ProgressFn = Callable[[dict[str, Any]], None]
@@ -146,7 +148,7 @@ def pick_name_sample(profile: ClientProfile, n: int) -> list[dict[str, Any]]:
     for row in data:
         if not isinstance(row, dict):
             continue
-        company = str(
+        company = conversational_company(row) or str(
             row.get("company_name")
             or row.get("name")
             or row.get("contractor_name")
@@ -194,6 +196,15 @@ def _score_people(
                 returned_domain=person.domain,
             ):
                 continue
+        geo = apply_person_geo(
+            person_state=person.person_state,
+            person_city=person.person_city,
+            company_state="",
+            geo=profile.geo,
+            default_confidence=person.source_confidence,
+        )
+        if not geo.keep:
+            continue
         returned += 1
         audit = audit_title(
             person.title,
@@ -249,6 +260,7 @@ def run_receipt(
         rates=rates,
         measured_rates=profile.people_measured_rates,
         dropped_tiers=profile.people_dropped_tiers,
+        include=include_from_profile(profile.people_tier_order),
     )
 
     domain_sample = pick_domain_sample(profile, n)
@@ -261,10 +273,11 @@ def run_receipt(
         role_unit = rates.unit_usd("leadmagic_role")
         serp_unit = rates.unit_usd("serp")
         prospeo_unit = rates.unit_usd("prospeo") * 0.5
+        n_styles = len(enabled_serp_styles(profile))
         est = (
             lm_unit * n * 8
             + ark_unit * (len(domain_sample) + len(name_sample)) * 3
-            + serp_unit * len(name_sample)
+            + serp_unit * (len(domain_sample) + len(name_sample)) * n_styles
             + role_unit * (len(domain_sample) + len(name_sample)) * 0.5
             + prospeo_unit * (len(domain_sample) + len(name_sample))
         )
@@ -339,34 +352,80 @@ def run_receipt(
         tiers = lane_tiers(order, "domain" if lane == "domain" else "name")
         # Receipt runs every paid tier, including those defaulted off in production.
         extra = []
-        if lane == "domain":
-            extra = ["prospeo", "leadmagic_role"]
-        else:
-            extra = ["prospeo", "leadmagic_role", "serp", "aiark"]
+        extra = ["discolike", "prospeo", "leadmagic_role", "serp"]
+        if lane != "domain":
+            extra.append("aiark")
         for t in extra:
             if t not in tiers:
                 tiers.append(t)
         for tier in tiers:
             scores[lane].setdefault(tier, _empty_tier_score())
+        styles = enabled_serp_styles(profile)
+        for letter in styles:
+            scores[lane].setdefault(style_key(letter), _empty_tier_score())
         for company in sample:
             for tier in tiers:
+                domain = str(company.get("domain") or "")
+                company_name = conversational_company(company) or str(
+                    company.get("company_name") or ""
+                )
+                city = str(company.get("city") or "")
+                state = str(company.get("state") or "")
+                if tier == "serp":
+                    meta = next((r for r in order if r["tier"] == "serp"), {})
+                    unit = float(meta.get("unit_usd") or 0)
+                    rollup = scores[lane]["serp"]
+                    rollup["companies"] += 1
+                    for letter in styles:
+                        skey = style_key(letter)
+                        block = scores[lane][skey]
+                        if not style_applies(
+                            letter,
+                            company_name=company_name,
+                            domain=domain,
+                            city=city,
+                        ):
+                            continue
+                        block["companies"] += 1
+                        people = bundle.serp.search_style(
+                            letter,
+                            profile=profile,
+                            company_name=company_name,
+                            domain=domain,
+                            city=city,
+                            titles=list(profile.target_titles),
+                        )
+                        tally = _score_people(
+                            people,
+                            profile=profile,
+                            company_name=company_name,
+                            domain=domain,
+                            known=company.get("known") or set(),
+                        )
+                        for key in ("people", "title_matched", "new", "already_known"):
+                            block[key] += tally[key]
+                            rollup[key] += tally[key]
+                        block["usd"] += unit
+                        rollup["usd"] += unit
+                        spent += unit
+                    continue
                 block = scores[lane][tier]
                 block["companies"] += 1
                 people = _call_tier(
                     tier,
                     bundle,
                     profile=profile,
-                    domain=str(company.get("domain") or ""),
-                    company_name=str(company.get("company_name") or ""),
-                    city=str(company.get("city") or ""),
-                    state=str(company.get("state") or ""),
+                    domain=domain,
+                    company_name=company_name,
+                    city=city,
+                    state=state,
                     titles=list(profile.target_titles),
                 )
                 tally = _score_people(
                     people,
                     profile=profile,
-                    company_name=str(company.get("company_name") or ""),
-                    domain=str(company.get("domain") or ""),
+                    company_name=company_name,
+                    domain=domain,
                     known=company.get("known") or set(),
                 )
                 for key in ("people", "title_matched", "new", "already_known"):
@@ -376,9 +435,7 @@ def run_receipt(
                 billing = meta.get("billing") or "always"
                 cost = 0.0
                 if billing == "always":
-                    if tier == "serp":
-                        cost = unit
-                    elif tier == "leadmagic_employee":
+                    if tier == "leadmagic_employee":
                         cost = unit * len(people)
                     else:
                         cost = unit * len(people)
@@ -390,7 +447,8 @@ def run_receipt(
             receipt_matched = sum(
                 int((block or {}).get("title_matched") or 0)
                 for lane_scores in scores.values()
-                for block in lane_scores.values()
+                for name, block in lane_scores.items()
+                if name != "serp"
             )
             emit_receipt("running", lane=lane)
 

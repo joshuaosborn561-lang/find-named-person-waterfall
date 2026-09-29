@@ -34,6 +34,21 @@ def test_people_keys_win_over_domain_keys():
     assert profile.people_dropped_tiers == ["serp"]
     assert profile.people_tier_order[0]["tier"] == "getleads"
     assert profile.people_measured_rates["getleads"]["title_matched"] == 89
+    assert profile.serp_styles == ["a", "b", "c", "d"]
+
+
+def test_serp_styles_and_dropped_style_keys():
+    profile = parse_profile(
+        "goliath",
+        {
+            "serp_styles": ["a", "c"],
+            "people_dropped_tiers": ["serp_b", "serp_d"],
+        },
+    )
+    assert profile.serp_styles == ["a", "c"]
+    assert profile.people_dropped_tiers == ["serp_b", "serp_d"]
+    defaulted = parse_profile("goliath", {})
+    assert defaulted.serp_styles == ["a", "b", "c", "d"]
 
 
 def test_domain_string_order_is_not_treated_as_people_order():

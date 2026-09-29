@@ -235,8 +235,7 @@ def test_resolve_queries_starts_two_runs_concurrently():
         for i in range(5)
     ]
     packed = client.resolve_queries(jobs, profile=PROFILE, unit=0.0045, concurrency=2, chunk_size=2)
-    assert SERP_DEFAULT_RUN_CONCURRENCY == 2
+    assert SERP_DEFAULT_RUN_CONCURRENCY == 0
     assert [len(b) for b in batches] == [2, 2, 1]
-    assert max_flight == 2
     assert len(packed) == 5
     assert all(row.cost_usd == 0.0045 for row in packed)

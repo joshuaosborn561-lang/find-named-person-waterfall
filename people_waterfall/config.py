@@ -21,6 +21,7 @@ API_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "leadmagic": ("leadmagic", "leadmagic_api_key", "LEADMAGIC_API_KEY", "LEADMAGIC_KEY"),
     "prospeo": ("prospeo", "prospeo_api_key", "PROSPEO_API_KEY"),
     "apify": ("apify", "apify_token", "APIFY_TOKEN", "APIFY_API_TOKEN"),
+    "discolike": ("discolike", "discolike_api_key", "DISCOLIKE_API_KEY", "DISCO_API_KEY"),
 }
 
 
@@ -44,6 +45,7 @@ class Settings:
     smartlead_base_url: str
     apify_token: str
     apify_serp_actor: str
+    discolike_api_key: str
     email_waterfall_url: str
 
     @property
@@ -74,6 +76,7 @@ def load_settings() -> Settings:
         ).rstrip("/"),
         apify_token=_env("APIFY_TOKEN") or _env("APIFY_API_TOKEN"),
         apify_serp_actor=_env("APIFY_SERP_ACTOR", "apify/google-search-scraper"),
+        discolike_api_key=_env("DISCOLIKE_API_KEY") or _env("DISCO_API_KEY"),
         email_waterfall_url=_env("EMAIL_WATERFALL_URL").rstrip("/"),
     )
 
@@ -110,5 +113,6 @@ def merge_private_keys(rows: list[dict[str, str]]) -> Settings:
         leadmagic_api_key=pick(settings.leadmagic_api_key, *API_KEY_ALIASES["leadmagic"]),
         prospeo_api_key=pick(settings.prospeo_api_key, *API_KEY_ALIASES["prospeo"]),
         apify_token=pick(settings.apify_token, *API_KEY_ALIASES["apify"]),
+        discolike_api_key=pick(settings.discolike_api_key, *API_KEY_ALIASES["discolike"]),
     )
     return updated

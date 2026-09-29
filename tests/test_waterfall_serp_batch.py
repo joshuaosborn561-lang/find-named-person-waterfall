@@ -14,6 +14,7 @@ PROFILE = parse_profile(
         "target_titles": ["Owner", "President"],
         "title_synonyms": {},
         "contacts_table": "demo_wf_contacts",
+        "serp_styles": ["a"],
     },
 )
 
@@ -24,6 +25,7 @@ FALLBACK_PROFILE = parse_profile(
         "fallback_titles": ["Vice President", "COO", "CFO"],
         "title_synonyms": {},
         "contacts_table": "demo_wf_contacts",
+        "serp_styles": ["a"],
     },
 )
 
@@ -40,6 +42,11 @@ class _Empty:
 
     def find_people_by_role(self, **kwargs):
         return []
+
+    def resolve_domains(self, domains, **kwargs):
+        from people_waterfall.vendors.discolike import DiscoDomainResult
+
+        return {d: DiscoDomainResult(domain=d) for d in domains}
 
 
 class _HitGetLeads(_Empty):
@@ -138,6 +145,7 @@ def _bundle(*, getleads=None, serp=None, prospeo=None) -> VendorBundle:
         aiark=_Empty(),
         serp=serp or _BatchSerp(),
         prospeo=prospeo or _Empty(),
+        discolike=_Empty(),
     )
 
 
@@ -158,7 +166,7 @@ def _run(monkeypatch, rows, vendors, *, profile=None, write_supabase=False, **kw
     monkeypatch.setattr(wf, "write_name_bank", lambda **k: None)
     monkeypatch.setattr(wf, "handoff_title_matches", lambda p: {})
 
-    def _writeback(src_obj, key, *, count, source, status):
+    def _writeback(src_obj, key, *, count, source, status, **_extra):
         writebacks.append((str(key), status, int(count)))
 
     monkeypatch.setattr(wf, "writeback_people", _writeback)
@@ -210,6 +218,22 @@ def test_serp_only_job_batches_queries_and_bills_per_query(monkeypatch):
     assert build_query("Acme Roofing", PROFILE.target_titles) in serp.batches[0]
 
 
+GETLEADS_THEN_SERP = parse_profile(
+    "demo",
+    {
+        "target_titles": ["Owner", "President"],
+        "title_synonyms": {},
+        "contacts_table": "demo_wf_contacts",
+        "serp_styles": ["a"],
+        "people_tier_order": [
+            {"tier": "cache"},
+            {"tier": "getleads"},
+            {"tier": "serp"},
+        ],
+    },
+)
+
+
 def test_cheaper_tier_hit_skips_serp_batch(monkeypatch):
     serp = _BatchSerp()
     rows = [
@@ -220,6 +244,7 @@ def test_cheaper_tier_hit_skips_serp_batch(monkeypatch):
         monkeypatch,
         rows,
         _bundle(getleads=_HitGetLeads(), serp=serp),
+        profile=GETLEADS_THEN_SERP,
         max_tier="serp",
     )
     assert len(serp.batches) == 1
@@ -311,3 +336,204 @@ def test_zero_pass_writeback_and_counter_wait_for_results(monkeypatch):
     assert result["counter"]["done"] == 2
     assert result["counter"]["companies_unresolved"] == 2
     assert all("Vice President" in q for q in serp.batches[1])
+
+
+STYLES_PROFILE = parse_profile(
+    "demo",
+    {
+        "target_titles": ["Owner", "Administrator", "Director"],
+        "title_synonyms": {},
+        "contacts_table": "demo_wf_contacts",
+        "serp_styles": ["a", "b", "c", "d"],
+    },
+)
+
+THREE_STYLE_PROFILE = parse_profile(
+    "demo",
+    {
+        "target_titles": ["Owner"],
+        "contacts_table": "demo_wf_contacts",
+        "serp_styles": ["a", "b", "c"],
+    },
+)
+
+
+class _StyleSerp(_BatchSerp):
+    def poll_run(self, run_id, *, timeout_s=None, n_queries=1):
+        try:
+            idx = int(str(run_id).split("-")[-1]) - 1
+            batch = self.batches[idx]
+        except (ValueError, IndexError):
+            batch = self.batches[-1] if self.batches else []
+        items = []
+        for query in batch:
+            if query.startswith("site:linkedin.com/in") and "Acme Roofing" in query:
+                items.append(
+                    {
+                        "searchQuery": {"term": query},
+                        "organicResults": [
+                            {
+                                "url": "https://www.linkedin.com/in/jane-doe-1",
+                                "personalInfo": {
+                                    "companyName": "Acme Roofing",
+                                    "jobTitle": "Owner",
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif query.startswith("site:beta.com"):
+                items.append(
+                    {
+                        "searchQuery": {"term": query},
+                        "organicResults": [
+                            {
+                                "url": "https://beta.com/our-team",
+                                "title": "Pat Lee | Owner | Beta Builders",
+                                "description": "Meet the Beta Builders leadership team.",
+                            }
+                        ],
+                    }
+                )
+            elif query.startswith("site:facebook.com") and "Gamma Homes" in query:
+                items.append(
+                    {
+                        "searchQuery": {"term": query},
+                        "organicResults": [
+                            {
+                                "url": "https://www.facebook.com/gammahomes",
+                                "title": "Gamma Homes | Dallas",
+                                "description": "Owned by Sam Wright. Serving Dallas.",
+                            }
+                        ],
+                    }
+                )
+            elif not query.startswith("site:") and "Delta Contractors" in query:
+                items.append(
+                    {
+                        "searchQuery": {"term": query},
+                        "organicResults": [
+                            {
+                                "url": "https://www.zoominfo.com/c/delta-contractors/9",
+                                "title": "Riley Chen - Director at Delta Contractors | ZoomInfo",
+                                "snippet": "Contact riley@deltaco.com",
+                            }
+                        ],
+                    }
+                )
+            else:
+                items.append({"searchQuery": {"term": query}, "organicResults": []})
+        return items
+
+
+def test_estimate_only_prices_styles_times_rows(monkeypatch):
+    rows = [_company("Acme Roofing", key="1"), _company("Beta Builders", key="2")]
+    result = _run(
+        monkeypatch,
+        rows,
+        _bundle(serp=_StyleSerp()),
+        profile=THREE_STYLE_PROFILE,
+        min_tier="serp",
+        max_tier="serp",
+        estimate_only=True,
+    )
+    assert result["estimate_only"] is True
+    serp_row = next(r for r in result["tiers"] if r["tier"] == "serp")
+    assert serp_row["estimated_usd"] == pytest.approx(0.0045 * 2 * 3)
+    assert result["estimated_usd"] == pytest.approx(0.0045 * 2 * 3)
+
+
+def test_styles_stop_early_and_record_per_style(monkeypatch):
+    serp = _StyleSerp()
+    rows = [
+        _company("Acme Roofing", key="1", domain="acme.com"),
+        _company("Beta Builders", key="2", domain="beta.com"),
+        _company("Gamma Homes", key="3", domain=""),
+        _company("Delta Contractors", key="4", domain=""),
+    ]
+    for row, city in zip(rows, ["Austin", "Dallas", "Dallas", "Houston"]):
+        row["city"] = city
+    result = _run(
+        monkeypatch,
+        rows,
+        _bundle(serp=serp),
+        profile=STYLES_PROFILE,
+        min_tier="serp",
+        max_tier="serp",
+        write_supabase=True,
+    )
+    all_queries = [q for batch in serp.batches for q in batch]
+    acme_b = [q for q in all_queries if q.startswith("site:acme.com")]
+    acme_c = [q for q in all_queries if q.startswith("site:facebook.com") and "Acme" in q]
+    assert not acme_b
+    assert not acme_c
+    assert any(q.startswith("site:beta.com") for q in all_queries)
+    assert any(q.startswith("site:facebook.com") and "Gamma Homes" in q for q in all_queries)
+    assert any("Delta Contractors" in q and not q.startswith("site:") for q in all_queries)
+    assert result["per_tier"]["serp_a"]["title_matched"] == 1
+    assert result["per_tier"]["serp_b"]["title_matched"] == 1
+    assert result["per_tier"]["serp_c"]["title_matched"] == 1
+    assert result["per_tier"]["serp_d"]["title_matched"] == 1
+    assert result["counts"]["resolved"] == 4
+    assert result["per_tier"]["serp"]["usd"] == result["spent_usd"]
+    assert result["per_tier"]["serp"]["calls"] == (
+        result["per_tier"]["serp_a"]["calls"]
+        + result["per_tier"]["serp_b"]["calls"]
+        + result["per_tier"]["serp_c"]["calls"]
+        + result["per_tier"]["serp_d"]["calls"]
+    )
+    assert result["spent_usd"] == pytest.approx(result["per_tier"]["serp"]["calls"] * 0.0045)
+
+
+def test_receipt_drops_zero_yield_style_keeps_serp(monkeypatch):
+    from people_waterfall import receipt as rec
+    from people_waterfall.people import PersonHit
+    from people_waterfall.pricing import LiveRates
+
+    class _ReceiptSerp(_Empty):
+        enabled = True
+
+        def search_style(self, style, **kwargs):
+            if style == "a":
+                return [
+                    PersonHit(
+                        first_name="Jane",
+                        last_name="Doe",
+                        title="Owner",
+                        company_name=kwargs.get("company_name") or "",
+                        domain=kwargs.get("domain") or "",
+                        source_tier="serp_a",
+                    )
+                ]
+            return []
+
+        def find_people(self, **kwargs):
+            return self.search_style("a", **kwargs)
+
+    monkeypatch.setattr(rec, "get_profile", lambda tag: STYLES_PROFILE)
+    monkeypatch.setattr(rec, "read_live_rates", lambda *a, **k: LiveRates())
+    monkeypatch.setattr(rec, "pick_domain_sample", lambda p, n: [])
+    monkeypatch.setattr(
+        rec,
+        "pick_name_sample",
+        lambda p, n: [
+            {
+                "domain": "acme.com",
+                "company_name": "Acme Roofing",
+                "city": "Austin",
+                "known": set(),
+                "known_count": 0,
+            }
+        ],
+    )
+    monkeypatch.setattr(rec, "update_profile_metrics", lambda *a, **k: None)
+    result = rec.run_receipt(
+        "demo",
+        n=1,
+        approve_cost_usd=10,
+        write_profile=False,
+        vendors=_bundle(serp=_ReceiptSerp()),
+    )
+    assert result["per_tier"]["serp_a"]["title_matched"] >= 1
+    assert "serp_b" in result["people_dropped_tiers"]
+    assert "serp" not in result["people_dropped_tiers"]

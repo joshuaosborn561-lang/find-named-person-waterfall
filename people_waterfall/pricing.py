@@ -9,6 +9,7 @@ A receipt may drop a zero-yield tier; it never reorders the rule.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,12 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "billing": "free",
         "credits": 0.0,
         "unit_usd": 0.0,
+        "receipt_lanes": ("domain",),
+    },
+    "discolike": {
+        "needs": "domain",
+        "billing": "always",
+        "credits": 0.0,
         "receipt_lanes": ("domain",),
     },
     "leadmagic_employee": {
@@ -95,18 +102,23 @@ TIER_ALIASES = {
     "ark": "aiark",
     "apify": "serp",
     "apify_serp": "serp",
+    "disco": "discolike",
+    "discogen": "discolike",
 }
 
 DEFAULT_ORDER = [
     "cache",
+    "discolike",
+    "leadmagic_employee",
+]
+OPT_IN_TIERS = (
     "getleads",
     "smartlead",
-    "leadmagic_employee",
     "aiark",
     "serp",
     "prospeo",
     "leadmagic_role",
-]
+)
 
 
 def normalize_tier(name: str) -> str:
@@ -132,6 +144,16 @@ class LiveRates:
             return 0.0
         if tier == "leadmagic_role" and self.leadmagic_search_free:
             return 0.0
+        if tier == "discolike":
+            try:
+                serper = float(os.environ.get("SERPER_USD_PER_QUERY") or 0.001)
+            except ValueError:
+                serper = 0.001
+            try:
+                company = float(os.environ.get("DISCOLIKE_USD_PER_COMPANY") or 0.0035)
+            except ValueError:
+                company = 0.0035
+            return serper * 2 + company
         if "unit_usd" in meta:
             return float(meta["unit_usd"])
         credits = float(meta.get("credits") or 0)
@@ -188,6 +210,8 @@ def compute_tier_order(
             continue
         seen.add(name)
         names.append(name)
+    # Default (and explicit people_tier_order) keep declared sequence.
+    # Receipt may drop a zero-yield tier; it does not cheapest-sort this list.
 
     def _rate(name: str) -> float | None:
         block = measured.get(name)
@@ -197,11 +221,6 @@ def compute_tier_order(
             return float(block)
         return None
 
-    names.sort(
-        key=lambda t: sort_key(
-            t, rates=rates, measured_rate=_rate(t), dropped=dropped
-        )
-    )
     out: list[dict[str, Any]] = []
     for name in names:
         meta = PUBLISHED[name]
@@ -221,6 +240,25 @@ def compute_tier_order(
             }
         )
     return out
+
+
+def include_from_profile(people_tier_order: list[Any] | None) -> list[str] | None:
+    """Explicit people_tier_order names, else None so DEFAULT_ORDER is used."""
+    if not people_tier_order:
+        return None
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in people_tier_order:
+        if isinstance(row, dict):
+            raw = str(row.get("tier") or "")
+        else:
+            raw = str(row or "")
+        name = normalize_tier(raw)
+        if not name or name in seen or name not in PUBLISHED:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names or None
 
 
 def parse_tier_list(value: str | list[str] | None) -> list[str]:

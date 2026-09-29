@@ -9,19 +9,28 @@ from typing import Any, Callable
 from . import config as cfg
 from .geo import apply_person_geo
 from .handoff import handoff_title_matches
-from .people import PersonHit, company_matches, looks_like_person
+from .people import PersonHit, company_matches, conversational_company, looks_like_person
 from .pricing import (
+    PUBLISHED,
     LiveRates,
     compute_tier_order,
-    lane_tiers,
+    include_from_profile,
     parse_tier_list,
     select_tiers,
 )
-from .profile import ClientProfile, get_profile, normalize_client_tag
+from .profile import (
+    ClientProfile,
+    build_discolike_icp,
+    get_profile,
+    merge_people_measured_rates,
+    normalize_client_tag,
+    persist_discolike_icp,
+)
 from .progress import counter_from_stats
 from .source import (
     TableSource,
     count_source,
+    count_source_with_domain,
     ensure_people_writeback,
     iter_source,
     parse_source,
@@ -31,12 +40,20 @@ from .titles import audit_title
 from .vendors.ai_ark import AiArkClient
 from .vendors.ai_ark import per_credit_from_payload as ark_per_credit
 from .vendors.cache import CacheClient
+from .vendors.discolike import DiscoLikeClient
 from .vendors.getleads import GetLeadsClient
 from .vendors.leadmagic import LeadMagicClient
 from .vendors.leadmagic import per_credit_from_payload as lm_per_credit
 from .vendors.prospeo import ProspeoClient
 from .vendors.prospeo import per_credit_from_payload as prospeo_per_credit
-from .vendors.serp import SerpClient, SerpQuery, build_query
+from .vendors.serp import (
+    SerpClient,
+    SerpQuery,
+    build_style_query,
+    enabled_serp_styles,
+    style_applies,
+    style_key,
+)
 from .vendors.smartlead import SmartleadClient
 from .write import (
     contact_payload,
@@ -58,6 +75,7 @@ class VendorBundle:
     aiark: AiArkClient
     serp: SerpClient
     prospeo: ProspeoClient
+    discolike: DiscoLikeClient
 
     def for_tier(self, tier: str) -> Any:
         return {
@@ -69,6 +87,7 @@ class VendorBundle:
             "aiark": self.aiark,
             "serp": self.serp,
             "prospeo": self.prospeo,
+            "discolike": self.discolike,
         }.get(tier)
 
 
@@ -81,6 +100,7 @@ def build_vendors() -> VendorBundle:
         aiark=AiArkClient(),
         serp=SerpClient(),
         prospeo=ProspeoClient(),
+        discolike=DiscoLikeClient(),
     )
 
 
@@ -174,15 +194,36 @@ def _lane_order(
     company_name: str,
 ) -> list[str]:
     """SERP is company+title search. Include it whenever it is allowed and
-    the row has a company name, even on the domain lane."""
-    lane_set = set(lane_tiers(order, lane))
+    the row has a company name, even on the domain lane.
+
+    min_tier / max_tier can name a tier that is not in the default order.
+    Use PUBLISHED.needs so those opt-in tiers still land on the right lane.
+    """
+    known = {row["tier"]: row for row in order}
     out: list[str] = []
     for tier in allowed:
-        if tier in lane_set:
+        meta = known.get(tier) or PUBLISHED.get(tier) or {}
+        needs = meta.get("needs")
+        if tier == "serp" and company_name:
             out.append(tier)
-        elif tier == "serp" and company_name:
+        elif lane == "domain" and needs in {"domain", "either"}:
+            out.append(tier)
+        elif lane == "name" and needs in {"name", "either"}:
             out.append(tier)
     return out
+
+
+def _meta_for(order: list[dict[str, Any]], tier: str, rates: LiveRates) -> dict[str, Any]:
+    row = next((r for r in order if r["tier"] == tier), None)
+    if row:
+        return row
+    meta = PUBLISHED.get(tier) or {}
+    return {
+        "tier": tier,
+        "unit_usd": rates.unit_usd(tier),
+        "billing": meta.get("billing") or "always",
+        "needs": meta.get("needs"),
+    }
 
 
 def _split_lane(lane_order: list[str]) -> tuple[list[str], bool, list[str]]:
@@ -210,6 +251,9 @@ class _CompanyWork:
     last_source: str = ""
     used_fallback: bool = False
     deferred: bool = False
+    reason: str = ""
+    email_pattern: str = ""
+    email_pattern_confidence: float | None = None
 
 
 def _audit_people(
@@ -284,25 +328,41 @@ def estimate_job(
     rows = count_source(src)
     per_tier: list[dict[str, Any]] = []
     total = 0.0
-    for row in order:
-        if row["tier"] not in tiers:
-            continue
+    by_name = {row["tier"]: row for row in order}
+    for name in tiers:
+        row = by_name.get(name)
+        if row is None:
+            from .pricing import PUBLISHED
+
+            meta = PUBLISHED.get(name) or {}
+            row = {
+                "tier": name,
+                "unit_usd": rates.unit_usd(name),
+                "billing": meta.get("billing"),
+                "needs": meta.get("needs"),
+                "measured_rate": None,
+            }
         unit = float(row.get("unit_usd") or 0)
         billing = row.get("billing")
+        priced_rows = rows
         if billing == "free":
             cost = 0.0
         elif billing == "free_on_miss":
             rate = row.get("measured_rate")
             cost = unit * rows * (rate if rate is not None else 0.5)
         elif row["tier"] == "serp":
-            cost = unit * rows
+            n_styles = len(enabled_serp_styles(profile))
+            cost = unit * rows * n_styles
+        elif row["tier"] == "discolike":
+            priced_rows = count_source_with_domain(src)
+            cost = unit * priced_rows
         else:
             cost = unit * rows
         total += cost
         per_tier.append(
             {
-                "tier": row["tier"],
-                "rows": rows,
+                "tier": name,
+                "rows": priced_rows,
                 "unit_usd": unit,
                 "billing": billing,
                 "estimated_usd": round(cost, 4),
@@ -363,6 +423,7 @@ def resolve_people(
         rates=rates,
         measured_rates=profile.people_measured_rates,
         dropped_tiers=profile.people_dropped_tiers,
+        include=include_from_profile(profile.people_tier_order),
     )
     allowed = select_tiers(
         order,
@@ -398,6 +459,12 @@ def resolve_people(
         "next_tier": None,
         "per_tier": {t: {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0} for t in allowed},
     }
+    if "serp" in allowed:
+        for letter in enabled_serp_styles(profile):
+            stats["per_tier"].setdefault(
+                style_key(letter),
+                {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0},
+            )
     deferred = False
     next_tier = None
 
@@ -424,6 +491,11 @@ def resolve_people(
     write_lock = threading.Lock()
     emit("running")
 
+    def _tier_stat(key: str) -> dict[str, Any]:
+        return stats["per_tier"].setdefault(
+            key, {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0}
+        )
+
     def _bill(
         tier: str,
         people: list[PersonHit],
@@ -431,6 +503,7 @@ def resolve_people(
         unit: float,
         billing: str,
         cost_override: float | None = None,
+        style: str | None = None,
     ) -> float:
         nonlocal spent
         if cost_override is not None:
@@ -451,7 +524,9 @@ def resolve_people(
         else:
             cost = 0.0
         spent += cost
-        stats["per_tier"][tier]["usd"] += cost
+        _tier_stat(tier)["usd"] += cost
+        if style:
+            _tier_stat(style_key(style))["usd"] += cost
         stats["spent_usd"] = spent
         return cost
 
@@ -462,7 +537,9 @@ def resolve_people(
         *,
         titles: list[str],
         fallback: bool,
+        source: str | None = None,
     ) -> None:
+        src = source or tier
         hits, bank = _audit_people(
             people,
             profile=profile,
@@ -476,7 +553,7 @@ def resolve_people(
                     client_tag=tag,
                     domain=work.domain,
                     person=person,
-                    source=tier,
+                    source=src,
                 )
             work.bank_count += 1
             stats["name_bank"] += 1
@@ -484,8 +561,10 @@ def resolve_people(
             if is_known(known, work.domain, person):
                 continue
             known.add(((work.domain or person.domain or ""), person.name_key))
-            work.last_source = tier
-            stats["per_tier"][tier]["title_matched"] += 1
+            work.last_source = src
+            _tier_stat(tier)["title_matched"] += 1
+            if src != tier:
+                _tier_stat(src)["title_matched"] += 1
             stats["title_matched"] += 1
             if require_title_match or audit.title_match:
                 work.accepted_rows.append(
@@ -495,7 +574,7 @@ def resolve_people(
                         client_tag=tag,
                         company_name=work.company,
                         domain=work.domain,
-                        source_tier=tier,
+                        source_tier=src,
                         source_confidence=conf,
                     )
                 )
@@ -514,9 +593,9 @@ def resolve_people(
 
     def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
         for tier in tiers:
-            if tier == "serp":
+            if tier in {"serp", "discolike"}:
                 continue
-            meta = next((r for r in order if r["tier"] == tier), {})
+            meta = _meta_for(order, tier, rates)
             unit = float(meta.get("unit_usd") or 0)
             billing = meta.get("billing") or "always"
             if _would_defer(tier, unit, billing):
@@ -548,22 +627,40 @@ def resolve_people(
         titles: list[str],
         fallback: bool,
         on_each: Callable[[_CompanyWork, Any], None],
+        *,
+        style: str = "a",
     ) -> None:
-        """Run one title-set batch. on_each fires as each company's dataset lands."""
+        """Run one style + title-set batch. on_each fires as each company lands."""
         if not works:
             return
         if not bundle.serp.enabled:
             for work in works:
                 on_each(work, None)
             return
-        meta = next((r for r in order if r["tier"] == "serp"), {})
+        meta = _meta_for(order, "serp", rates)
         unit = float(meta.get("unit_usd") or 0)
         billing = meta.get("billing") or "always"
         jobs: list[SerpQuery] = []
         work_by_key: dict[str, _CompanyWork] = {}
         pending = list(works)
+        letter = (style or "a").strip().lower().removeprefix("serp_")
+        src = style_key(letter)
         for idx, work in enumerate(pending):
-            query = build_query(work.company, titles)
+            if not style_applies(
+                letter,
+                company_name=work.company,
+                domain=work.domain,
+                city=work.city,
+            ):
+                on_each(work, None)
+                continue
+            query = build_style_query(
+                letter,
+                company_name=work.company,
+                domain=work.domain,
+                city=work.city,
+                titles=titles,
+            )
             if not query:
                 on_each(work, None)
                 continue
@@ -582,6 +679,9 @@ def resolve_people(
                     query=query,
                     company_name=work.company,
                     titles=list(titles),
+                    style=letter,
+                    domain=work.domain,
+                    city=work.city,
                 )
             )
         if not jobs:
@@ -596,13 +696,105 @@ def resolve_people(
                         continue
                     people = list(getattr(item, "people", None) or [])
                     cost = float(getattr(item, "cost_usd", 0) or 0)
-                    stats["per_tier"]["serp"]["calls"] += 1
-                    stats["per_tier"]["serp"]["people"] += len(people)
-                    _bill("serp", people, unit=unit, billing=billing, cost_override=cost)
-                    _apply_people(work, "serp", people, titles=titles, fallback=fallback)
+                    item_style = str(getattr(item, "style", letter) or letter)
+                    item_src = style_key(item_style)
+                    _tier_stat("serp")["calls"] += 1
+                    _tier_stat("serp")["people"] += len(people)
+                    _tier_stat(item_src)["calls"] += 1
+                    _tier_stat(item_src)["people"] += len(people)
+                    _bill(
+                        "serp",
+                        people,
+                        unit=unit,
+                        billing=billing,
+                        cost_override=cost,
+                        style=item_style,
+                    )
+                    _apply_people(
+                        work,
+                        "serp",
+                        people,
+                        titles=titles,
+                        fallback=fallback,
+                        source=item_src,
+                    )
                     on_each(work, item)
 
         bundle.serp.resolve_queries(jobs, profile=profile, unit=unit, on_chunk=on_chunk)
+
+    def run_discolike_batch(works: list[_CompanyWork]) -> None:
+        if not works:
+            return
+        meta = _meta_for(order, "discolike", rates)
+        unit = float(meta.get("unit_usd") or 0)
+        billing = meta.get("billing") or "always"
+        if not bundle.discolike.enabled:
+            for work in works:
+                if not work.domain:
+                    work.reason = work.reason or "no_domain"
+            return
+        icp = build_discolike_icp(profile)
+        if write_supabase and not profile.discolike_icp_text:
+            try:
+                persist_discolike_icp(tag, icp)
+                profile.discolike_icp_text = icp
+            except Exception:  # noqa: BLE001
+                pass
+        queued: list[_CompanyWork] = []
+        for work in works:
+            if not work.domain:
+                work.reason = "no_domain"
+                continue
+            if _would_defer("discolike", unit, billing):
+                work.deferred = True
+                for rest in works[works.index(work) + 1 :]:
+                    rest.deferred = True
+                break
+            queued.append(work)
+        if not queued:
+            return
+        emit("discolike")
+        companies = {work.domain: work.company for work in queued if work.domain}
+        packed = bundle.discolike.resolve_domains(
+            [work.domain for work in queued],
+            profile=profile,
+            companies=companies,
+            unit=unit,
+            icp_text=icp,
+        )
+        by_domain: dict[str, list[_CompanyWork]] = {}
+        for work in queued:
+            by_domain.setdefault(work.domain, []).append(work)
+        for domain, group in by_domain.items():
+            row = packed.get(domain)
+            people = list(row.people) if row else []
+            bank_only = list(row.bank_only) if row else []
+            cost = float(row.cost_usd) if row else 0.0
+            _tier_stat("discolike")["calls"] += 1
+            _tier_stat("discolike")["people"] += len(people) + len(bank_only)
+            _bill("discolike", people, unit=unit, billing=billing, cost_override=cost)
+            for work in group:
+                if row and row.email_pattern:
+                    work.email_pattern = row.email_pattern
+                    work.email_pattern_confidence = row.email_pattern_confidence
+                for person in bank_only:
+                    if write_supabase:
+                        write_name_bank(
+                            client_tag=tag,
+                            domain=work.domain,
+                            person=person,
+                            source="discolike",
+                        )
+                    work.bank_count += 1
+                    stats["name_bank"] += 1
+                _apply_people(
+                    work,
+                    "discolike",
+                    people,
+                    titles=target_titles,
+                    fallback=False,
+                    source="discolike",
+                )
 
     def finalize(work: _CompanyWork) -> None:
         if work.row.get("_finalized"):
@@ -628,8 +820,11 @@ def resolve_people(
                 src,
                 work.row.get("_source_key"),
                 count=len(work.accepted_rows),
-                source=work.last_source or ("fallback" if work.used_fallback else "serp"),
+                source=work.last_source or ("fallback" if work.used_fallback else "discolike"),
                 status=status,
+                reason=work.reason,
+                email_pattern=work.email_pattern,
+                email_pattern_confidence=work.email_pattern_confidence,
             )
         emit()
 
@@ -641,6 +836,7 @@ def resolve_people(
                 work.deferred = True
             finalize(work)
 
+    pending_disco: list[_CompanyWork] = []
     pending_serp: list[_CompanyWork] = []
     pending_after: list[_CompanyWork] = []
     target_titles = list(profile.target_titles)
@@ -648,14 +844,22 @@ def resolve_people(
 
     for row in iter_source(src):
         domain = str(row.get("domain") or "").strip().lower()
-        company = str(row.get("company_name") or "").strip()
+        company = conversational_company(row) or str(row.get("company_name") or "").strip()
         city = str(row.get("city") or "").strip()
         state = str(row.get("state") or "").strip()
         first = str(row.get("first_name") or "").strip()
         last = str(row.get("last_name") or "").strip()
         lane = "domain" if domain else "name"
         lane_order = _lane_order(allowed, order, lane, company)
-        before, has_serp, after = _split_lane(lane_order)
+        first_batch = next((t for t in lane_order if t in {"discolike", "serp"}), "")
+        if first_batch:
+            idx = lane_order.index(first_batch)
+            before, rest = lane_order[:idx], lane_order[idx:]
+        else:
+            before, rest = list(lane_order), []
+        has_disco = "discolike" in rest or "discolike" in lane_order
+        has_serp = "serp" in rest
+        after = [t for t in rest if t not in {"discolike", "serp"}]
         work = _CompanyWork(
             row=row,
             domain=domain,
@@ -675,6 +879,19 @@ def resolve_people(
             if deferred:
                 break
             continue
+        if has_disco:
+            if not work.domain:
+                work.reason = "no_domain"
+                if work.has_serp:
+                    pending_serp.append(work)
+                    continue
+                if work.after:
+                    pending_after.append(work)
+                    continue
+                finalize(work)
+                continue
+            pending_disco.append(work)
+            continue
         if work.has_serp:
             pending_serp.append(work)
             continue
@@ -684,42 +901,96 @@ def resolve_people(
         if fallback_titles:
             work.used_fallback = True
             run_pass(work, work.before, fallback_titles, True)
+        if not work.domain and not work.accepted_rows:
+            work.reason = work.reason or "no_domain"
         finalize(work)
         if deferred:
             break
 
-    fallback_serp: list[_CompanyWork] = []
-
-    def after_target(work: _CompanyWork, item: Any) -> None:
-        if work.accepted_rows or work.deferred:
-            finalize(work)
-            return
-        company_matched = int(getattr(item, "company_matched", 0) or 0) if item else 0
-        if company_matched:
+    if pending_disco:
+        emit("discolike")
+        run_discolike_batch(pending_disco)
+        for work in pending_disco:
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+                continue
+            if work.has_serp:
+                pending_serp.append(work)
+                continue
             if work.after:
-                run_pass(work, work.after, target_titles, False)
+                pending_after.append(work)
+                continue
+            if fallback_titles:
+                work.used_fallback = True
+                run_pass(work, work.before, fallback_titles, True)
             finalize(work)
-            return
-        if fallback_titles:
-            work.used_fallback = True
-            fallback_serp.append(work)
-            return
-        if work.after:
-            run_pass(work, work.after, target_titles, False)
-        finalize(work)
+            if deferred:
+                finalize_rest(
+                    [w for w in pending_disco if not w.row.get("_finalized")],
+                    as_deferred=True,
+                )
+                break
+        finalize_rest(pending_disco)
 
-    def after_fallback(work: _CompanyWork, item: Any) -> None:
-        if not work.accepted_rows and not work.deferred and work.after:
-            run_pass(work, work.after, fallback_titles, True)
-        finalize(work)
+    def _serp_open(works: list[_CompanyWork]) -> list[_CompanyWork]:
+        return [
+            work
+            for work in works
+            if not work.accepted_rows
+            and not work.deferred
+            and not work.row.get("_finalized")
+        ]
 
     if pending_serp:
         emit("serp")
-        run_serp_batch(pending_serp, target_titles, False, after_target)
-        if fallback_serp and not deferred:
-            run_serp_batch(fallback_serp, fallback_titles, True, after_fallback)
-        elif fallback_serp:
-            finalize_rest(fallback_serp, as_deferred=True)
+        styles = enabled_serp_styles(profile)
+        fallback_serp: list[_CompanyWork] = []
+
+        def after_a_target(work: _CompanyWork, item: Any) -> None:
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+                return
+            company_matched = int(getattr(item, "company_matched", 0) or 0) if item else 0
+            if company_matched:
+                return
+            if fallback_titles:
+                work.used_fallback = True
+                fallback_serp.append(work)
+
+        def after_style(work: _CompanyWork, item: Any) -> None:
+            if work.accepted_rows or work.deferred:
+                finalize(work)
+
+        if "a" in styles:
+            run_serp_batch(pending_serp, target_titles, False, after_a_target, style="a")
+            still_fallback = _serp_open(fallback_serp)
+            if still_fallback and not deferred:
+                run_serp_batch(
+                    still_fallback, fallback_titles, True, after_style, style="a"
+                )
+            elif still_fallback:
+                finalize_rest(still_fallback, as_deferred=True)
+
+        for letter in styles:
+            if letter == "a" or deferred:
+                continue
+            still = _serp_open(pending_serp)
+            if not still:
+                break
+            run_serp_batch(still, target_titles, False, after_style, style=letter)
+
+        leftover = _serp_open(pending_serp)
+        if leftover and not deferred:
+            for i, work in enumerate(leftover):
+                titles = fallback_titles if work.used_fallback else target_titles
+                if work.after:
+                    run_pass(work, work.after, titles, work.used_fallback)
+                finalize(work)
+                if deferred:
+                    finalize_rest(leftover[i + 1 :], as_deferred=True)
+                    break
+        elif leftover:
+            finalize_rest(leftover, as_deferred=True)
         finalize_rest(pending_serp)
 
     if pending_after and not deferred:
@@ -783,6 +1054,28 @@ def resolve_people(
         },
         "handoff": handoff,
     }
+    if write_supabase and "discolike" in stats["per_tier"] and not estimate_only:
+        block = stats["per_tier"]["discolike"]
+        calls = int(block.get("calls") or 0)
+        try:
+            merge_people_measured_rates(
+                tag,
+                {
+                    "discolike": {
+                        "title_matched": int(block.get("title_matched") or 0),
+                        "people": int(block.get("people") or 0),
+                        "companies": calls,
+                        "usd": round(float(block.get("usd") or 0), 4),
+                        "title_match_rate": round(
+                            int(block.get("title_matched") or 0) / calls, 4
+                        )
+                        if calls
+                        else 0.0,
+                    }
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            rates.notes.append(f"measured_rates write failed: {type(exc).__name__}")
     if progress_callback:
         progress_callback({**result, "status": result["status"]})
     return result
