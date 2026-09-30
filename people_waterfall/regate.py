@@ -24,7 +24,7 @@ def _known_contacts(profile: ClientProfile) -> set[tuple[str, str, str]]:
     cursor = 0
     while True:
         rows = _page(
-            profile.contacts_table,
+            profile.contacts_table_name,
             {
                 "select": "id,domain,first_name,last_name",
                 "id": f"gt.{cursor}",

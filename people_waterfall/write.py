@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from . import supabase_sync
 from .people import PersonHit, normalize_name
 from .profile import ClientProfile
+from .source import split_qualified
 from .titles import TitleAudit
+
+WRITE_CHUNK = 500
+WRITE_ATTEMPTS = 3
+CONTACTS_CONFLICT = "client_tag,domain,first_name_key,last_name_key"
+NAME_BANK_COLUMNS = (
+    "client_tag",
+    "domain",
+    "first_name",
+    "last_name",
+    "job_title",
+    "linkedin_url",
+    "source",
+    "status",
+    "rejection_reason",
+)
 
 CONTACT_COLUMNS = (
     "first_name",
@@ -74,17 +91,97 @@ def contact_payload(
     return row
 
 
+def _rank_key(row: dict[str, Any]) -> tuple[int, int]:
+    """Lower title_rank wins. A missing rank is worse than any real rank."""
+    raw = row.get("title_rank")
+    if raw is None or raw == "":
+        return (1, 0)
+    try:
+        return (0, int(raw))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
+def person_conflict_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("client_tag") or ""),
+        str(row.get("domain") or "").strip().lower(),
+        str(row.get("first_name") or "").strip().lower(),
+        str(row.get("last_name") or "").strip().lower(),
+    )
+
+
+def dedupe_person_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per (client_tag, domain, lower first, lower last). Best title_rank stays."""
+    best: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        key = person_conflict_key(row)
+        current = best.get(key)
+        if current is None:
+            best[key] = row
+            order.append(key)
+            continue
+        if _rank_key(row) < _rank_key(current):
+            best[key] = row
+    return [best[key] for key in order]
+
+
+def call_with_retry(fn: Callable[[], Any]) -> Any:
+    delay = 0.5
+    last: Exception | None = None
+    for attempt in range(WRITE_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt + 1 >= WRITE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    if last:
+        raise last
+    return None
+
+
+def _write_chunks(rows: list[dict[str, Any]], sender: Callable[[list[dict[str, Any]]], int]) -> int:
+    written = 0
+    for i in range(0, len(rows), WRITE_CHUNK):
+        chunk = rows[i : i + WRITE_CHUNK]
+        call_with_retry(lambda chunk=chunk: sender(chunk))
+        written += len(chunk)
+    return written
+
+
+def _contact_keys(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["domain"] = str(item.get("domain") or "").strip().lower()
+    item["first_name_key"] = str(item.get("first_name") or "").strip().lower()
+    item["last_name_key"] = str(item.get("last_name") or "").strip().lower()
+    return item
+
+
 def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
+    table = profile.contacts_table_name
     try:
         supabase_sync.rpc(
             "pw_ensure_contacts_columns",
-            {"p_table": profile.contacts_table},
+            {"p_table": table},
         )
     except RuntimeError:
         pass
-    return supabase_sync.rest_insert(profile.contacts_table, rows)
+    prepared = [_contact_keys(row) for row in dedupe_person_rows(rows)]
+    return _write_chunks(
+        prepared,
+        lambda chunk: supabase_sync.rest_upsert(
+            table,
+            chunk,
+            on_conflict=CONTACTS_CONFLICT,
+            batch_size=WRITE_CHUNK,
+        ),
+    )
 
 
 def name_bank_row(
@@ -108,13 +205,20 @@ def name_bank_row(
 
 
 def write_name_bank_rows(rows: list[dict[str, Any]]) -> int:
-    """Insert name_bank rows. Raises on failure. Duplicate keys are merges."""
+    """Upsert name_bank rows. Raises on failure. Duplicate keys are merges."""
     if not rows:
         return 0
-    return supabase_sync.rest_upsert(
-        "name_bank",
-        rows,
-        on_conflict="client_tag,domain,first_name,last_name",
+    prepared = []
+    for row in dedupe_person_rows(rows):
+        prepared.append({k: v for k, v in row.items() if k in NAME_BANK_COLUMNS})
+    return _write_chunks(
+        prepared,
+        lambda chunk: supabase_sync.rest_upsert(
+            "name_bank",
+            chunk,
+            on_conflict="client_tag,domain,first_name,last_name",
+            batch_size=WRITE_CHUNK,
+        ),
     )
 
 
@@ -130,34 +234,58 @@ def write_name_bank(
     )
 
 
-def load_known_names(profile: ClientProfile) -> set[tuple[str, str]]:
-    """(domain, normalized name) already owned or globally suppressed."""
-    known: set[tuple[str, str]] = set()
-    tables = [f"public.{profile.contacts_table}", *profile.cache_tables, "public.name_bank"]
-    for qualified in tables:
-        schema, table = (
-            qualified.split(".", 1) if "." in qualified else ("public", qualified)
+def _page_known(schema: str, table: str) -> list[dict[str, Any]]:
+    """Read every row. ew_read_source caps a page at 500; follow the id cursor."""
+    cursor: str | None = None
+    out: list[dict[str, Any]] = []
+    while True:
+        data = supabase_sync.rpc(
+            "ew_read_source",
+            {
+                "p_schema": schema,
+                "p_table": table,
+                "p_filters": [],
+                "p_columns": ["id", "domain", "first_name", "last_name"],
+                "p_key_column": "id",
+                "p_after": cursor,
+                "p_limit": 500,
+            },
         )
+        rows = [row for row in (data if isinstance(data, list) else []) if isinstance(row, dict)]
+        if not rows:
+            break
+        out.extend(rows)
+        if len(rows) < 500:
+            break
+        last_id = rows[-1].get("id")
+        if last_id is None:
+            break
+        nxt = str(last_id)
+        if nxt == cursor:
+            break
+        cursor = nxt
+    return out
+
+
+def load_known_names(profile: ClientProfile) -> set[tuple[str, str]]:
+    """(domain, normalized name) already owned or globally suppressed.
+
+    profile.contacts_table already includes the schema. Do not prefix public. again.
+    """
+    known: set[tuple[str, str]] = set()
+    tables = [profile.contacts_table, *profile.cache_tables, "public.name_bank"]
+    for qualified in tables:
         try:
-            data = supabase_sync.rpc(
-                "ew_read_source",
-                {
-                    "p_schema": schema,
-                    "p_table": table,
-                    "p_filters": [],
-                    "p_columns": ["domain", "first_name", "last_name"],
-                    "p_key_column": "domain",
-                    "p_after": None,
-                    "p_limit": 500,
-                },
-            )
+            schema, table = split_qualified(qualified)
+        except ValueError:
+            continue
+        if not table:
+            continue
+        try:
+            rows = _page_known(schema, table)
         except RuntimeError:
             continue
-        rows = data if isinstance(data, list) else []
-        # Page a few times; cache check is best-effort, not a full dump.
-        for raw in rows[:500]:
-            if not isinstance(raw, dict):
-                continue
+        for raw in rows:
             domain = str(raw.get("domain") or "").strip().lower()
             key = normalize_name(
                 str(raw.get("first_name") or ""), str(raw.get("last_name") or "")

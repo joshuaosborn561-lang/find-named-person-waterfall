@@ -107,7 +107,20 @@ class ClientProfile:
 
     @property
     def contacts_table(self) -> str:
-        return f"{self.client_tag}_wf_contacts"
+        """Schema-qualified contacts relation. Already includes the schema."""
+        raw = str(self.raw.get("contacts_table") or "").strip()
+        if not raw:
+            raw = str(self.contacts_table_ref().get("qualified") or "").strip()
+        if not raw:
+            raw = f"{self.client_tag}_wf_contacts"
+        if "." not in raw:
+            return f"public.{raw}"
+        return raw
+
+    @property
+    def contacts_table_name(self) -> str:
+        """Unqualified table name for PostgREST and pw_ensure_contacts_columns."""
+        return self.contacts_table.rsplit(".", 1)[-1]
 
     @property
     def person_geo_mode(self) -> str:
@@ -138,7 +151,7 @@ class ClientProfile:
             "people_measured_rates": dict(self.people_measured_rates),
             "discolike_icp_text": self.discolike_icp_text,
             "domain_tier_order": list(self.domain_tier_order),
-            "contacts_table": f"public.{self.contacts_table}",
+            "contacts_table": self.contacts_table,
         }
 
 

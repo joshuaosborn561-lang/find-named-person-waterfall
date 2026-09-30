@@ -73,7 +73,8 @@ def test_regate_promotes_literal_titles_without_vendors(monkeypatch):
         return bank
 
     def insert(profile, rows):
-        assert profile.contacts_table == "emcor_wf_contacts"
+        assert profile.contacts_table == "public.emcor_wf_contacts"
+        assert profile.contacts_table_name == "emcor_wf_contacts"
         contacts.extend(rows)
         return len(rows)
 
