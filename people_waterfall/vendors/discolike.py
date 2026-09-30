@@ -181,7 +181,11 @@ class DiscoLikeClient:
             raise RuntimeError("discolike generate called with no domains")
         if not (icp_text or "").strip():
             raise RuntimeError("discolike icp_text is empty")
-        integration = (integration_id or "").strip() or self.serper_integration_id()
+        # integration_id selects the extractor. "native" is DiscoLike Groove
+        # (no LLM key). The Serper connection is search_provider_id; sending
+        # that UUID as integration_id 404s.
+        integration = (integration_id or "").strip() or "native"
+        search_provider = self.serper_integration_id()
         url = f"{self.base_url}{DISCOGEN_GENERATE}"
         r = http_client.post(
             self.tier,
@@ -190,6 +194,7 @@ class DiscoLikeClient:
                 "icp_text": icp_text.strip(),
                 "domains": cleaned,
                 "integration_id": integration,
+                "search_provider_id": search_provider,
                 "search_context_size": "low",
                 "max_contacts_per_domain": max(1, int(max_contacts)),
                 "find_emails": False,
@@ -200,7 +205,12 @@ class DiscoLikeClient:
         if r is None:
             raise RuntimeError("discolike generate failed (no response)")
         if r.status_code >= 400:
-            raise RuntimeError(f"discolike generate failed ({r.status_code})")
+            detail = ""
+            try:
+                detail = (r.text or "")[:240].replace("\n", " ")
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"discolike generate failed ({r.status_code}) {detail}".strip())
         try:
             data = r.json()
         except ValueError as exc:
@@ -364,12 +374,9 @@ class DiscoLikeClient:
             raise RuntimeError("DISCOLIKE_API_KEY is missing")
         icp = (icp_text or "").strip() or build_discolike_icp(profile)
         price = unit if unit is not None else unit_usd()
-        integration = self.serper_integration_id()
         out: dict[str, DiscoDomainResult] = {}
         for chunk in chunked(cleaned, TASK_CAP):
-            task_id = self.start_generate(
-                chunk, icp_text=icp, max_contacts=max_contacts, integration_id=integration
-            )
+            task_id = self.start_generate(chunk, icp_text=icp, max_contacts=max_contacts)
             payload = self.poll_task(task_id, n_domains=len(chunk))
             parsed = self.parse_results(payload, profile=profile, companies=companies)
             for domain in chunk:

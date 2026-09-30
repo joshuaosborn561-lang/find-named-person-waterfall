@@ -192,7 +192,7 @@ def _run(monkeypatch, rows, vendors, **kwargs):
     monkeypatch.setattr(wf, "write_contacts", writer or (lambda p, accepted: len(accepted)))
     monkeypatch.setattr(wf, "write_name_bank_rows", lambda rows: len(rows))
     monkeypatch.setattr(wf, "handoff_title_matches", lambda p: {})
-    monkeypatch.setattr(wf, "writeback_people", lambda *a, **k: None)
+    monkeypatch.setattr(wf, "writeback_people", kwargs.pop("writeback_fn", lambda *a, **k: None))
     monkeypatch.setattr(wf, "persist_discolike_icp", lambda *a, **k: None)
     monkeypatch.setattr(wf, "merge_people_measured_rates", lambda *a, **k: None)
     write = kwargs.pop("write_supabase", False)
@@ -342,7 +342,8 @@ def test_generate_uses_serper_integration(monkeypatch):
     monkeypatch.setattr(mod.http_client, "get", fake_get)
     monkeypatch.setattr(mod.http_client, "post", fake_post)
     assert client.start_generate(["acme.com"], icp_text="directors at contractors") == "task-9"
-    assert posted[0]["integration_id"] == "serper-1"
+    assert posted[0]["integration_id"] == "native"
+    assert posted[0]["search_provider_id"] == "serper-1"
     assert client.calls == 1
 
 
@@ -371,9 +372,25 @@ def test_job_writes_title_match_and_skips_no_domain(monkeypatch):
         {"domain": "acme.com", "company_name": "Acme", "_source_key": "1"},
         {"domain": "", "company_name": "No Domain LLC", "_source_key": "2"},
     ]
-    result = _run(monkeypatch, rows, _bundle(), max_tier="discolike")
+    written_status: list[dict] = []
+
+    def _writeback(*args, **kwargs):
+        written_status.append(kwargs)
+
+    result = _run(
+        monkeypatch,
+        rows,
+        _bundle(),
+        max_tier="discolike",
+        write_supabase=True,
+        writeback_fn=_writeback,
+    )
     assert result["counts"]["resolved"] == 1
     assert result["counts"]["people_unresolved"] == 1
+    assert result["counts"]["written"] == 1
     assert result["per_tier"]["discolike"]["title_matched"] == 1
     assert result["per_tier"]["discolike"]["calls"] == 1
     assert result["spent_usd"] == pytest.approx(0.0055)
+    sources = [call.get("source") for call in written_status]
+    assert "discolike" in sources
+    assert any(call.get("status") == "resolved" for call in written_status)

@@ -596,6 +596,7 @@ def resolve_people(
                 last_name=work.last,
             )
             work.tiers_called.add(tier)
+            work.last_source = tier
             work.seen_people.extend(people)
             stats["per_tier"][tier]["calls"] += 1
             stats["per_tier"][tier]["people"] += len(people)
@@ -669,6 +670,7 @@ def resolve_people(
             _bill("discolike", people, unit=unit, billing=billing, cost_override=cost)
             for work in group:
                 work.tiers_called.add("discolike")
+                work.last_source = "discolike"
                 if row and row.email_pattern:
                     work.email_pattern = row.email_pattern
                     work.email_pattern_confidence = row.email_pattern_confidence

@@ -40,8 +40,9 @@ default tier; it does not cheapest-sort the declared order.
 DiscoLike is the primary discovery tier. It needs a domain. One sequential
 task for the full domain list (cap 5,000; more domains run as later
 tasks, never concurrent). search_context_size=low (2 queries),
-max_contacts_per_domain=3, find_emails=false. integration_id is the
-account's Serper provider from GET /v1/search-providers, not "native".
+max_contacts_per_domain=3, find_emails=false. integration_id is
+"native" (Groove, no LLM key). search_provider_id is the account's
+Serper provider from GET /v1/search-providers.
 A selected paid tier that makes zero calls fails the job.
 icp_text comes from profile.discolike_icp_text (generated from
 target_titles + vertical on first run). Cost is
