@@ -31,14 +31,49 @@ def test_title_rank_is_index():
     assert audit.title_rank == 3
 
 
-def test_seniority_floor_rejects_below():
+def test_seniority_floor_does_not_reject_literal_target():
     audit = audit_title(
         "Coordinator",
         target_titles=["Coordinator", "Manager"],
         seniority_floor="manager",
     )
+    assert audit.below_floor is False
+    assert audit.title_match is True
+
+
+def test_seniority_floor_rejects_non_literal_title():
+    audit = audit_title(
+        "Marketing Coordinator",
+        target_titles=["Manager"],
+        seniority_floor="manager",
+    )
     assert audit.below_floor is True
     assert audit.title_match is False
+
+
+def test_emcor_pastor_and_dentist_pass_manager_floor():
+    targets = ["Lead Pastor", "Pastor", "Dentist", "Owner"]
+    exclude = (
+        r"(assistant|associate|youth|children|worship|hygienist|intern|"
+        r"technician|tech\b|driver|receptionist)"
+    )
+    for title in ("Lead Pastor", "Pastor", "Dentist"):
+        audit = audit_title(
+            title,
+            target_titles=targets,
+            seniority_floor="manager",
+            title_exclude_regex=exclude,
+        )
+        assert audit.title_match is True, title
+        assert audit.below_floor is False
+    youth = audit_title(
+        "Youth Pastor",
+        target_titles=targets,
+        seniority_floor="manager",
+        title_exclude_regex=exclude,
+    )
+    assert youth.title_match is False
+    assert youth.excluded is True
 
 
 def test_goliath_it_manager_kept_ceo_dropped():

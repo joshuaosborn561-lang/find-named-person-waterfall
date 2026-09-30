@@ -150,6 +150,14 @@ def meets_seniority_floor(title: str, floor: str) -> bool:
     return seniority_value(title) >= needed
 
 
+def is_literal_target(job_title: str, target_titles: list[str]) -> bool:
+    """True when the job title is one of the profile titles, not a substring."""
+    nt = normalize_title(job_title)
+    if not nt:
+        return False
+    return any(normalize_title(target) == nt for target in target_titles if target)
+
+
 @dataclass(frozen=True)
 class TitleAudit:
     title_match: bool
@@ -181,6 +189,11 @@ def audit_title(
     # contains the word President; normalize_title rewrites that to "vp".
     if excluded_by_regex(normalize_title(normalized), title_exclude_regex):
         return TitleAudit(False, None, normalized, True, False)
+    # A title the client listed is a match even when it has no seniority token
+    # (Pastor, Dentist) or scores below the floor (Lead Pastor → "lead").
+    for i, target in enumerate(target_titles):
+        if is_literal_target(job_title, [target]) or is_literal_target(normalized, [target]):
+            return TitleAudit(True, i, normalized, False, False)
     if not meets_seniority_floor(normalized, seniority_floor):
         return TitleAudit(False, None, normalized, False, True)
 

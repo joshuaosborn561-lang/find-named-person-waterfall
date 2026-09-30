@@ -103,6 +103,7 @@ def name_bank_row(
         "linkedin_url": person.linkedin_url or None,
         "source": source or person.source_tier,
         "status": "wrong_title",
+        "rejection_reason": person.rejection_reason or "title",
     }
 
 

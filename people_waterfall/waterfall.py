@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .geo import apply_person_geo
+from .gate import gate_person
 from .handoff import handoff_title_matches
-from .people import PersonHit, company_matches, conversational_company, looks_like_person
+from .people import PersonHit, conversational_company, looks_like_person
 from .pricing import (
     PUBLISHED,
     LiveRates,
@@ -34,7 +34,6 @@ from .source import (
     parse_source,
     writeback_people,
 )
-from .titles import audit_title
 from .vendors.cache import CacheClient
 from .vendors.discolike import DiscoLikeClient
 from .vendors.leadmagic import LeadMagicClient
@@ -199,48 +198,18 @@ def _audit_people(
     for person in pool:
         if not looks_like_person(person.first_name, person.last_name):
             continue
-        if not company_matches(
-            input_company=company_name,
-            input_domain=domain,
-            returned_company=person.company_name,
-            returned_domain=person.domain,
-        ):
-            if domain and person.domain and person.domain != domain:
-                continue
-            if company_name and person.company_name:
-                continue
-            if domain and not person.domain and not person.company_name:
-                person.domain = domain
-                person.company_name = company_name
-            elif not company_matches(
-                input_company=company_name,
-                input_domain=domain,
-                returned_company=person.company_name or company_name,
-                returned_domain=person.domain or domain,
-            ):
-                continue
-        geo = apply_person_geo(
-            person_state=person.person_state,
-            person_city=person.person_city,
-            company_state="",
-            geo=profile.geo,
-            default_confidence=person.source_confidence,
-        )
-        if not geo.keep:
-            continue
-        audit = audit_title(
-            person.title,
-            target_titles=profile.target_titles,
-            title_synonyms=profile.title_synonyms,
-            title_exclude_regex=profile.title_exclude_regex,
-            seniority_floor=profile.seniority_floor,
-            fallback_titles=profile.fallback_titles,
+        decision = gate_person(
+            person,
+            profile,
+            company_name=company_name,
+            domain=domain,
             use_fallback=use_fallback,
         )
-        if audit.title_match:
-            accepted.append((person, audit, geo.confidence))
-        else:
+        if decision.reason:
+            person.rejection_reason = decision.reason
             bank.append(person)
+            continue
+        accepted.append((person, decision.audit, decision.confidence))
     return accepted, bank
 
 
@@ -674,20 +643,12 @@ def resolve_people(
                 if row and row.email_pattern:
                     work.email_pattern = row.email_pattern
                     work.email_pattern_confidence = row.email_pattern_confidence
-                for person in bank_only:
-                    key = person.name_key or f"{person.first_name}|{person.last_name}"
-                    if key in work.handled_keys:
-                        continue
-                    work.handled_keys.add(key)
-                    work.bank_people.append(person)
-                    work.bank_count += 1
-                    stats["name_bank"] += 1
                 work.seen_people.extend(people)
                 work.seen_people.extend(bank_only)
                 _apply_people(
                     work,
                     "discolike",
-                    people,
+                    [*people, *bank_only],
                     titles=target_titles,
                     fallback=False,
                     source="discolike",

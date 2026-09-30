@@ -65,8 +65,14 @@ in resolved | partial | deferred | people_unresolved.
 
 Never touch dl_status, sg_exclude, or skip_*.
 
-Wrong titles go to public.name_bank. Every accepted person passes the company
-match (first ten characters or equal domain) and the title audit.
+Wrong titles go to public.name_bank with rejection_reason
+title, seniority, geo, or company. A title that is literally in
+target_titles is not rejected by seniority_floor. A contact with no
+city and no state passes the geo gate. regate_name_bank(client_tag)
+re-applies the current profile to banked rows and promotes passes
+into the contacts table. It does not call a vendor.
+Every accepted person passes the company match (first ten characters
+or equal domain) and the title audit.
 """
 
 WHEN_TO_USE = """Use People Waterfall when the task is "who works here in this title?"
