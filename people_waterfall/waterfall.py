@@ -43,8 +43,9 @@ from .write import (
     contact_payload,
     is_known,
     load_known_names,
+    name_bank_row,
     write_contacts,
-    write_name_bank,
+    write_name_bank_rows,
 )
 
 ProgressFn = Callable[[dict[str, Any]], None]
@@ -166,6 +167,13 @@ class _CompanyWork:
     before: list[str]
     after: list[str]
     accepted_rows: list[dict[str, Any]] = field(default_factory=list)
+    bank_people: list[PersonHit] = field(default_factory=list)
+    seen_people: list[PersonHit] = field(default_factory=list)
+    tiers_called: set[str] = field(default_factory=set)
+    handled_keys: set[str] = field(default_factory=set)
+    persisted_contacts: int = 0
+    persisted_bank: int = 0
+    finished: bool = False
     bank_count: int = 0
     last_source: str = ""
     used_fallback: bool = False
@@ -435,18 +443,28 @@ def resolve_people(
             use_fallback=fallback,
         )
         for person in bank:
-            if write_supabase:
-                write_name_bank(
-                    client_tag=tag,
-                    domain=work.domain,
-                    person=person,
-                    source=src_name,
-                )
+            key = person.name_key or f"{person.first_name}|{person.last_name}"
+            if key in work.handled_keys:
+                continue
+            work.handled_keys.add(key)
+            work.bank_people.append(person)
             work.bank_count += 1
             stats["name_bank"] += 1
         for person, audit, conf in hits:
-            if is_known(known, work.domain, person):
+            key = person.name_key or f"{person.first_name}|{person.last_name}"
+            if key in work.handled_keys and not any(
+                (row.get("first_name"), row.get("last_name"))
+                == (person.first_name, person.last_name)
+                for row in work.accepted_rows
+            ):
+                # Fallback titles can promote a previously banked name.
+                work.handled_keys.discard(key)
+            if key in work.handled_keys:
                 continue
+            if is_known(known, work.domain, person):
+                work.handled_keys.add(key)
+                continue
+            work.handled_keys.add(key)
             known.add(((work.domain or person.domain or ""), person.name_key))
             work.last_source = src_name
             _tier_stat(tier)["title_matched"] += 1
@@ -478,13 +496,90 @@ def resolve_people(
         stats["next_tier"] = tier
         return True
 
+    def _company_status(work: _CompanyWork) -> str:
+        if work.deferred:
+            return "deferred"
+        if work.accepted_rows:
+            return "resolved"
+        if work.bank_count:
+            return "partial"
+        return "people_unresolved"
+
+    def _flush(works: list[_CompanyWork], *, finished: bool) -> None:
+        """Persist this tier batch before the next tier spends."""
+        bank_rows: list[dict[str, Any]] = []
+        contact_rows: list[dict[str, Any]] = []
+        for work in works:
+            fresh_bank = work.bank_people[work.persisted_bank :]
+            work.persisted_bank = len(work.bank_people)
+            for person in fresh_bank:
+                bank_rows.append(
+                    name_bank_row(
+                        client_tag=tag,
+                        domain=work.domain,
+                        person=person,
+                        source=work.last_source or person.source_tier or "discolike",
+                    )
+                )
+            fresh_contacts = work.accepted_rows[work.persisted_contacts :]
+            work.persisted_contacts = len(work.accepted_rows)
+            contact_rows.extend(fresh_contacts)
+        if write_supabase and bank_rows:
+            write_name_bank_rows(bank_rows)
+        if write_supabase and contact_rows:
+            stats["written"] += write_contacts(profile, contact_rows)
+        if write_supabase:
+            for work in works:
+                writeback_people(
+                    src,
+                    work.row.get("_source_key"),
+                    count=len(work.accepted_rows),
+                    source=work.last_source or ("fallback" if work.used_fallback else ""),
+                    status=_company_status(work),
+                    reason=work.reason,
+                    email_pattern=work.email_pattern,
+                    email_pattern_confidence=work.email_pattern_confidence,
+                )
+        if not finished:
+            emit()
+            return
+        for work in works:
+            if work.finished:
+                continue
+            work.finished = True
+            work.row["_finalized"] = True
+            stats["companies"] += 1
+            status = _company_status(work)
+            if status == "deferred":
+                stats["deferred"] += 1
+            elif status == "resolved":
+                stats["resolved"] += 1
+            elif status == "partial":
+                stats["partial"] += 1
+            else:
+                stats["people_unresolved"] += 1
+        emit()
+
+    def _finish(work: _CompanyWork) -> None:
+        _flush([work], finished=True)
+
     def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
         for tier in tiers:
             if tier == "discolike":
                 continue
+            if work.accepted_rows:
+                return
+            if tier in work.tiers_called:
+                continue
             meta = _meta_for(order, tier, rates)
             unit = float(meta.get("unit_usd") or 0)
             billing = meta.get("billing") or "always"
+            if billing != "free":
+                client = bundle.for_tier(tier)
+                if client is None or not getattr(client, "enabled", True):
+                    raise RuntimeError(
+                        f"{tier} is selected but is not enabled; refusing to fall through"
+                    )
             if _would_defer(tier, unit, billing):
                 work.deferred = True
                 return
@@ -500,10 +595,14 @@ def resolve_people(
                 first_name=work.first,
                 last_name=work.last,
             )
+            work.tiers_called.add(tier)
+            work.seen_people.extend(people)
             stats["per_tier"][tier]["calls"] += 1
             stats["per_tier"][tier]["people"] += len(people)
             _bill(tier, people, unit=unit, billing=billing)
             _apply_people(work, tier, people, titles=titles, fallback=fallback)
+            # Persist this company before the next paid call.
+            _flush([work], finished=False)
             if work.accepted_rows or deferred:
                 if deferred:
                     work.deferred = True
@@ -515,32 +614,34 @@ def resolve_people(
         meta = _meta_for(order, "discolike", rates)
         unit = float(meta.get("unit_usd") or 0)
         billing = meta.get("billing") or "always"
-        if not bundle.discolike.enabled:
-            for work in works:
-                if not work.domain:
-                    work.reason = work.reason or "no_domain"
-            return
         icp = build_discolike_icp(profile)
         if write_supabase and not profile.discolike_icp_text:
-            try:
-                persist_discolike_icp(tag, icp)
-                profile.discolike_icp_text = icp
-            except Exception:  # noqa: BLE001
-                pass
+            persist_discolike_icp(tag, icp)
+            profile.discolike_icp_text = icp
         queued: list[_CompanyWork] = []
         for work in works:
+            if work.accepted_rows:
+                continue
             if not work.domain:
                 work.reason = "no_domain"
+                continue
+            if "discolike" in work.tiers_called:
                 continue
             if _would_defer("discolike", unit, billing):
                 work.deferred = True
                 for rest in works[works.index(work) + 1 :]:
-                    rest.deferred = True
+                    if not rest.accepted_rows:
+                        rest.deferred = True
                 break
             queued.append(work)
         if not queued:
             return
+        if not bundle.discolike.enabled:
+            raise RuntimeError(
+                "discolike is selected but DISCOLIKE_API_KEY is missing; refusing to fall through"
+            )
         emit("discolike")
+        calls_before = int(getattr(bundle.discolike, "calls", 0) or 0)
         companies = {work.domain: work.company for work in queued if work.domain}
         packed = bundle.discolike.resolve_domains(
             [work.domain for work in queued],
@@ -549,6 +650,12 @@ def resolve_people(
             unit=unit,
             icp_text=icp,
         )
+        calls_made = int(getattr(bundle.discolike, "calls", 0) or 0) - calls_before
+        if calls_made <= 0:
+            raise RuntimeError(
+                getattr(bundle.discolike, "last_error", "")
+                or "discolike was selected but made 0 calls; refusing to fall through"
+            )
         by_domain: dict[str, list[_CompanyWork]] = {}
         for work in queued:
             by_domain.setdefault(work.domain, []).append(work)
@@ -561,19 +668,20 @@ def resolve_people(
             _tier_stat("discolike")["people"] += len(people) + len(bank_only)
             _bill("discolike", people, unit=unit, billing=billing, cost_override=cost)
             for work in group:
+                work.tiers_called.add("discolike")
                 if row and row.email_pattern:
                     work.email_pattern = row.email_pattern
                     work.email_pattern_confidence = row.email_pattern_confidence
                 for person in bank_only:
-                    if write_supabase:
-                        write_name_bank(
-                            client_tag=tag,
-                            domain=work.domain,
-                            person=person,
-                            source="discolike",
-                        )
+                    key = person.name_key or f"{person.first_name}|{person.last_name}"
+                    if key in work.handled_keys:
+                        continue
+                    work.handled_keys.add(key)
+                    work.bank_people.append(person)
                     work.bank_count += 1
                     stats["name_bank"] += 1
+                work.seen_people.extend(people)
+                work.seen_people.extend(bank_only)
                 _apply_people(
                     work,
                     "discolike",
@@ -582,42 +690,17 @@ def resolve_people(
                     fallback=False,
                     source="discolike",
                 )
+        # Write the whole DiscoLike batch before any later tier spends.
+        _flush(queued, finished=False)
 
     def finalize(work: _CompanyWork) -> None:
-        if work.row.get("_finalized"):
+        if work.finished:
             return
-        work.row["_finalized"] = True
-        stats["companies"] += 1
-        if work.accepted_rows and write_supabase:
-            stats["written"] += write_contacts(profile, work.accepted_rows)
-        if work.deferred:
-            status = "deferred"
-            stats["deferred"] += 1
-        elif work.accepted_rows:
-            status = "resolved"
-            stats["resolved"] += 1
-        elif work.bank_count:
-            status = "partial"
-            stats["partial"] += 1
-        else:
-            status = "people_unresolved"
-            stats["people_unresolved"] += 1
-        if write_supabase:
-            writeback_people(
-                src,
-                work.row.get("_source_key"),
-                count=len(work.accepted_rows),
-                source=work.last_source or ("fallback" if work.used_fallback else "discolike"),
-                status=status,
-                reason=work.reason,
-                email_pattern=work.email_pattern,
-                email_pattern_confidence=work.email_pattern_confidence,
-            )
-        emit()
+        _finish(work)
 
     def finalize_rest(works: list[_CompanyWork], *, as_deferred: bool = False) -> None:
         for work in works:
-            if work.row.get("_finalized"):
+            if work.finished:
                 continue
             if as_deferred and not work.accepted_rows:
                 work.deferred = True
@@ -665,59 +748,91 @@ def resolve_people(
         if has_disco:
             if not work.domain:
                 work.reason = "no_domain"
-                if work.after:
+                if work.after and not work.accepted_rows:
                     pending_after.append(work)
                     continue
                 finalize(work)
                 continue
             pending_disco.append(work)
             continue
-        if work.after:
+        if work.after and not work.accepted_rows:
             pending_after.append(work)
             continue
-        if fallback_titles:
+        if fallback_titles and work.seen_people and not work.accepted_rows:
             work.used_fallback = True
-            run_pass(work, work.before, fallback_titles, True)
+            _apply_people(work, work.last_source or "cache", work.seen_people, titles=fallback_titles, fallback=True)
         if not work.domain and not work.accepted_rows:
             work.reason = work.reason or "no_domain"
         finalize(work)
         if deferred:
             break
 
-    if pending_disco:
+    if pending_disco and not deferred:
         emit("discolike")
         run_discolike_batch(pending_disco)
+        handed_off: set[int] = set()
         for work in pending_disco:
+            if work.finished:
+                continue
             if work.accepted_rows or work.deferred:
                 finalize(work)
+                if deferred:
+                    break
                 continue
             if work.after:
                 pending_after.append(work)
+                handed_off.add(id(work))
                 continue
-            if fallback_titles:
+            if fallback_titles and work.seen_people:
                 work.used_fallback = True
-                run_pass(work, work.before, fallback_titles, True)
+                _apply_people(
+                    work,
+                    work.last_source or "discolike",
+                    work.seen_people,
+                    titles=fallback_titles,
+                    fallback=True,
+                )
             finalize(work)
             if deferred:
-                finalize_rest(
-                    [w for w in pending_disco if not w.row.get("_finalized")],
-                    as_deferred=True,
-                )
                 break
-        finalize_rest(pending_disco)
+        if deferred:
+            finalize_rest(
+                [w for w in pending_disco if not w.finished and id(w) not in handed_off],
+                as_deferred=True,
+            )
+    elif pending_disco:
+        finalize_rest(pending_disco, as_deferred=True)
 
     if pending_after and not deferred:
         for i, work in enumerate(pending_after):
+            if work.accepted_rows:
+                finalize(work)
+                continue
             run_pass(work, work.after, list(profile.target_titles), False)
-            if not work.accepted_rows and profile.fallback_titles and not deferred:
+            if not work.accepted_rows and profile.fallback_titles and work.seen_people and not deferred:
                 work.used_fallback = True
-                run_pass(work, work.before + work.after, list(profile.fallback_titles), True)
+                _apply_people(
+                    work,
+                    work.last_source or (work.after[-1] if work.after else "cache"),
+                    work.seen_people,
+                    titles=list(profile.fallback_titles),
+                    fallback=True,
+                )
             finalize(work)
             if deferred:
                 finalize_rest(pending_after[i + 1 :], as_deferred=True)
                 break
     elif pending_after:
         finalize_rest(pending_after, as_deferred=True)
+
+    if write_supabase and not deferred and spent > 0 and int(stats["written"]) <= 0:
+        raise RuntimeError(
+            f"spent ${spent:.4f} but wrote 0 contacts; refusing to mark the job completed"
+        )
+    if not deferred and int(stats["companies"]) < int(total_rows):
+        raise RuntimeError(
+            f"finished {stats['companies']} of {total_rows} companies; refusing to mark the job completed"
+        )
 
     handoff: dict[str, Any] = {}
     if write_supabase and stats["title_matched"] and not estimate_only:

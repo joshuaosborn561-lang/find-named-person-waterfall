@@ -54,6 +54,12 @@ def _reload_settings() -> None:
             cfg.settings = cfg.merge_private_keys(rows)
     except Exception:
         pass
+    # Vendors read the live settings object. Also mirror onto the process env
+    # so a key loaded from private.api_keys is visible to os.environ checks.
+    if cfg.settings.discolike_api_key and not os.environ.get("DISCOLIKE_API_KEY"):
+        os.environ["DISCOLIKE_API_KEY"] = cfg.settings.discolike_api_key
+    if cfg.settings.leadmagic_api_key and not os.environ.get("LEADMAGIC_API_KEY"):
+        os.environ["LEADMAGIC_API_KEY"] = cfg.settings.leadmagic_api_key
 
 
 TOOL_NAMES = [

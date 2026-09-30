@@ -188,17 +188,19 @@ def _run(monkeypatch, rows, vendors, **kwargs):
     monkeypatch.setattr(wf, "read_live_rates", lambda *a, **k: LiveRates())
     monkeypatch.setattr(wf, "ensure_people_writeback", lambda s: None)
     monkeypatch.setattr(wf, "load_known_names", lambda p: set())
-    monkeypatch.setattr(wf, "write_contacts", lambda p, accepted: len(accepted))
-    monkeypatch.setattr(wf, "write_name_bank", lambda **k: None)
+    writer = kwargs.pop("write_contacts_fn", None)
+    monkeypatch.setattr(wf, "write_contacts", writer or (lambda p, accepted: len(accepted)))
+    monkeypatch.setattr(wf, "write_name_bank_rows", lambda rows: len(rows))
     monkeypatch.setattr(wf, "handoff_title_matches", lambda p: {})
     monkeypatch.setattr(wf, "writeback_people", lambda *a, **k: None)
     monkeypatch.setattr(wf, "persist_discolike_icp", lambda *a, **k: None)
     monkeypatch.setattr(wf, "merge_people_measured_rates", lambda *a, **k: None)
+    write = kwargs.pop("write_supabase", False)
     return resolve_people(
         source_table="public.emcor_companies",
         where="domain is not null and wf_people_status = 'people_unresolved'",
         client_tag="emcor",
-        write_supabase=False,
+        write_supabase=write,
         vendors=vendors,
         **kwargs,
     )
@@ -224,6 +226,144 @@ def test_estimate_only_emcor_unresolved_selects_and_prices_discolike(monkeypatch
     assert disco["rows"] == 2
     assert disco["estimated_usd"] == pytest.approx(0.0055 * 2)
     assert disco["unit_usd"] == pytest.approx(0.0055)
+
+
+class _Lead:
+    enabled = True
+
+    def __init__(self):
+        self.seen: list[str] = []
+
+    def employee_finder(self, **kwargs):
+        self.seen.append(kwargs.get("domain") or "")
+        return []
+
+    def find_people(self, **kwargs):
+        return []
+
+
+class _OffDisco:
+    enabled = False
+    calls = 0
+
+    def resolve_domains(self, *args, **kwargs):
+        raise AssertionError("discolike must not be called without an API key")
+
+
+def test_missing_key_fails_before_leadmagic(monkeypatch):
+    lead = _Lead()
+    rows = [{"domain": "acme.com", "company_name": "Acme", "_source_key": "1"}]
+    with pytest.raises(RuntimeError, match="DISCOLIKE_API_KEY"):
+        _run(monkeypatch, rows, VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_OffDisco()))
+    assert lead.seen == []
+
+
+def test_leadmagic_runs_only_without_title_match(monkeypatch):
+    lead = _Lead()
+    rows = [
+        {"domain": "acme.com", "company_name": "Acme", "_source_key": "1"},
+        {"domain": "beta.com", "company_name": "Beta", "_source_key": "2"},
+    ]
+    seen_done: list[int] = []
+
+    def _progress(payload):
+        counter = payload.get("counter") or {}
+        if "done" in counter:
+            seen_done.append(int(counter["done"]))
+
+    result = _run(
+        monkeypatch,
+        rows,
+        VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_Disco()),
+        progress_callback=_progress,
+    )
+    assert lead.seen == ["beta.com"]
+    assert result["per_tier"]["leadmagic_employee"]["calls"] == 1
+    assert result["per_tier"]["discolike"]["calls"] == 2
+    assert result["counter"]["done"] == 2
+    assert result["counts"]["companies"] == 2
+    # done counts companies that finished every tier, not per-tier calls.
+    assert seen_done[0] == 0
+    assert seen_done[-1] == 2
+
+
+def test_write_failure_stops_before_next_tier(monkeypatch):
+    from people_waterfall import waterfall as wf
+
+    lead = _Lead()
+    rows = [{"domain": "acme.com", "company_name": "Acme", "_source_key": "1"}]
+
+    def _boom(profile, accepted):
+        raise RuntimeError("insert failed")
+
+    with pytest.raises(RuntimeError, match="insert failed"):
+        _run(
+            monkeypatch,
+            rows,
+            VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_Disco()),
+            write_supabase=True,
+            write_contacts_fn=_boom,
+        )
+    assert lead.seen == []
+
+
+def test_generate_uses_serper_integration(monkeypatch):
+    from people_waterfall.vendors import discolike as mod
+
+    client = DiscoLikeClient(api_key="tok")
+    posted: list[dict] = []
+
+    class _Resp:
+        def __init__(self, payload, status=200):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(tier, url, **kwargs):
+        return _Resp(
+            {
+                "providers": [
+                    {
+                        "provider": "serper",
+                        "integration_name": "Serper",
+                        "integration_id": "serper-1",
+                        "encrypted_api_key": "do-not-log",
+                    }
+                ]
+            }
+        )
+
+    def fake_post(tier, url, **kwargs):
+        posted.append(kwargs.get("json") or {})
+        return _Resp({"task_id": "task-9"})
+
+    monkeypatch.setattr(mod.http_client, "get", fake_get)
+    monkeypatch.setattr(mod.http_client, "post", fake_post)
+    assert client.start_generate(["acme.com"], icp_text="directors at contractors") == "task-9"
+    assert posted[0]["integration_id"] == "serper-1"
+    assert client.calls == 1
+
+
+def test_emcor_source_maps_domain_column(monkeypatch):
+    from people_waterfall import source as source_mod
+
+    src = TableSource(project_id="x", schema="public", table="emcor_companies")
+    monkeypatch.setattr(
+        source_mod,
+        "list_columns",
+        lambda _src: {
+            "id",
+            "domain",
+            "company_name",
+            "city",
+            "state",
+            "website",
+        },
+    )
+    source_mod.discover_column_map(src)
+    assert src.column_map["domain"] == "domain"
 
 
 def test_job_writes_title_match_and_skips_no_domain(monkeypatch):

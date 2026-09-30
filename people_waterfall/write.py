@@ -87,14 +87,14 @@ def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
     return supabase_sync.rest_insert(profile.contacts_table, rows)
 
 
-def write_name_bank(
+def name_bank_row(
     *,
     client_tag: str,
     domain: str,
     person: PersonHit,
     source: str,
-) -> None:
-    row = {
+) -> dict[str, Any]:
+    return {
         "client_tag": client_tag,
         "domain": (domain or person.domain or "").strip().lower() or "",
         "first_name": person.first_name or None,
@@ -104,10 +104,29 @@ def write_name_bank(
         "source": source or person.source_tier,
         "status": "wrong_title",
     }
-    try:
-        supabase_sync.rest_insert("name_bank", [row])
-    except RuntimeError:
-        return
+
+
+def write_name_bank_rows(rows: list[dict[str, Any]]) -> int:
+    """Insert name_bank rows. Raises on failure. Duplicate keys are merges."""
+    if not rows:
+        return 0
+    return supabase_sync.rest_upsert(
+        "name_bank",
+        rows,
+        on_conflict="client_tag,domain,first_name,last_name",
+    )
+
+
+def write_name_bank(
+    *,
+    client_tag: str,
+    domain: str,
+    person: PersonHit,
+    source: str,
+) -> None:
+    write_name_bank_rows(
+        [name_bank_row(client_tag=client_tag, domain=domain, person=person, source=source)]
+    )
 
 
 def load_known_names(profile: ClientProfile) -> set[tuple[str, str]]:

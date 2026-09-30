@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from people_waterfall import http_client
-from people_waterfall.config import settings
 from people_waterfall.people import (
     PersonHit,
     looks_like_person,
@@ -107,11 +106,22 @@ class DiscoLikeClient:
     base_url = "https://api.discolike.com/v1"
 
     def __init__(self, api_key: str | None = None, timeout: int = 45):
-        self.api_key = api_key if api_key is not None else settings.discolike_api_key
+        # None reads the live settings object. An explicit "" disables the tier.
+        self._api_key_override = api_key
         self.timeout = timeout
         self.calls = 0
         self.hits = 0
         self.tasks = 0
+        self.last_error = ""
+        self._integration_id = ""
+
+    @property
+    def api_key(self) -> str:
+        if self._api_key_override is not None:
+            return self._api_key_override
+        from people_waterfall import config as cfg
+
+        return cfg.settings.discolike_api_key or ""
 
     @property
     def enabled(self) -> bool:
@@ -124,16 +134,54 @@ class DiscoLikeClient:
             "Accept": "application/json",
         }
 
+    def serper_integration_id(self) -> str:
+        """DiscoLike bills Serper through a connected search provider, not "native"."""
+        if self._integration_id:
+            return self._integration_id
+        if not self.enabled:
+            raise RuntimeError("DISCOLIKE_API_KEY is missing")
+        url = f"{self.base_url}/search-providers"
+        r = http_client.get(self.tier, url, headers=self._headers(), timeout=30)
+        if r is None:
+            raise RuntimeError("DiscoLike search-providers lookup failed (no response)")
+        if r.status_code >= 400:
+            raise RuntimeError(f"DiscoLike search-providers lookup failed ({r.status_code})")
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise RuntimeError("DiscoLike search-providers returned non-JSON") from exc
+        providers = data.get("providers") if isinstance(data, dict) else None
+        if not isinstance(providers, list) or not providers:
+            raise RuntimeError("DiscoLike search-providers returned no providers")
+        for row in providers:
+            if not isinstance(row, dict):
+                continue
+            provider = str(row.get("provider") or "").strip().lower()
+            name = str(row.get("integration_name") or "").strip().lower()
+            if provider != "serper" and name != "serper":
+                continue
+            integration_id = str(row.get("integration_id") or "").strip()
+            if integration_id:
+                self._integration_id = integration_id
+                return integration_id
+        raise RuntimeError("DiscoLike account has no Serper integration")
+
     def start_generate(
         self,
         domains: list[str],
         *,
         icp_text: str,
         max_contacts: int = MAX_CONTACTS,
-    ) -> str | None:
+        integration_id: str = "",
+    ) -> str:
         cleaned = [_norm_host(d) for d in domains if _norm_host(d)]
-        if not self.enabled or not cleaned or not (icp_text or "").strip():
-            return None
+        if not self.enabled:
+            raise RuntimeError("DISCOLIKE_API_KEY is missing")
+        if not cleaned:
+            raise RuntimeError("discolike generate called with no domains")
+        if not (icp_text or "").strip():
+            raise RuntimeError("discolike icp_text is empty")
+        integration = (integration_id or "").strip() or self.serper_integration_id()
         url = f"{self.base_url}{DISCOGEN_GENERATE}"
         r = http_client.post(
             self.tier,
@@ -141,7 +189,7 @@ class DiscoLikeClient:
             json={
                 "icp_text": icp_text.strip(),
                 "domains": cleaned,
-                "integration_id": "native",
+                "integration_id": integration,
                 "search_context_size": "low",
                 "max_contacts_per_domain": max(1, int(max_contacts)),
                 "find_emails": False,
@@ -149,19 +197,21 @@ class DiscoLikeClient:
             headers=self._headers(),
             timeout=min(self.timeout, 60),
         )
-        if r is None or r.status_code >= 400:
-            return None
+        if r is None:
+            raise RuntimeError("discolike generate failed (no response)")
+        if r.status_code >= 400:
+            raise RuntimeError(f"discolike generate failed ({r.status_code})")
         try:
             data = r.json()
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise RuntimeError("discolike generate returned non-JSON") from exc
         if not isinstance(data, dict):
-            return None
+            raise RuntimeError("discolike generate returned an unexpected payload")
         task_id = str(
             data.get("task_id") or data.get("id") or (data.get("data") or {}).get("task_id") or ""
         )
         if not task_id:
-            return None
+            raise RuntimeError("discolike generate returned no task_id")
         self.calls += len(cleaned)
         self.tasks += 1
         log.info("discolike started task_id=%s domains=%s", task_id, len(cleaned))
@@ -189,9 +239,9 @@ class DiscoLikeClient:
             if status in DONE_OK:
                 return data
             if status in DONE_BAD:
-                return {}
+                raise RuntimeError(f"discolike task {task_id} {status or 'failed'}")
             time.sleep(interval)
-        return {}
+        raise RuntimeError(f"discolike task {task_id} timed out")
 
     def parse_results(
         self,
@@ -308,24 +358,26 @@ class DiscoLikeClient:
                 continue
             seen.add(host)
             cleaned.append(host)
-        empty = {d: DiscoDomainResult(domain=d) for d in cleaned}
-        if not self.enabled or not cleaned:
-            return empty
+        if not cleaned:
+            return {}
+        if not self.enabled:
+            raise RuntimeError("DISCOLIKE_API_KEY is missing")
         icp = (icp_text or "").strip() or build_discolike_icp(profile)
         price = unit if unit is not None else unit_usd()
+        integration = self.serper_integration_id()
         out: dict[str, DiscoDomainResult] = {}
         for chunk in chunked(cleaned, TASK_CAP):
-            task_id = self.start_generate(chunk, icp_text=icp, max_contacts=max_contacts)
-            if not task_id:
-                for domain in chunk:
-                    out.setdefault(domain, DiscoDomainResult(domain=domain))
-                continue
+            task_id = self.start_generate(
+                chunk, icp_text=icp, max_contacts=max_contacts, integration_id=integration
+            )
             payload = self.poll_task(task_id, n_domains=len(chunk))
             parsed = self.parse_results(payload, profile=profile, companies=companies)
             for domain in chunk:
                 row = parsed.get(domain) or DiscoDomainResult(domain=domain)
                 row.cost_usd = price
                 out[domain] = row
+        if self.calls <= 0:
+            raise RuntimeError(self.last_error or "discolike made 0 calls")
         return out
 
     def find_people(
@@ -339,8 +391,10 @@ class DiscoLikeClient:
         titles: list[str] | None = None,
     ) -> list[PersonHit]:
         host = _norm_host(domain)
-        if not self.enabled or not host:
+        if not host:
             return []
+        if not self.enabled:
+            raise RuntimeError("DISCOLIKE_API_KEY is missing")
         packed = self.resolve_domains(
             [host],
             profile=profile,

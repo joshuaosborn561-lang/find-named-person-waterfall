@@ -354,13 +354,10 @@ def count_source(src: TableSource, cap: int = 50_000) -> int:
 def ensure_people_writeback(src: TableSource) -> None:
     if not src.writeback:
         return
-    try:
-        supabase_sync.rpc(
-            "pw_ensure_people_writeback",
-            {"p_schema": src.schema, "p_table": src.table},
-        )
-    except RuntimeError:
-        return
+    supabase_sync.rpc(
+        "pw_ensure_people_writeback",
+        {"p_schema": src.schema, "p_table": src.table},
+    )
 
 
 def writeback_people(
@@ -374,8 +371,10 @@ def writeback_people(
     email_pattern: str = "",
     email_pattern_confidence: float | None = None,
 ) -> None:
-    if not src.writeback or source_key in (None, ""):
+    if not src.writeback:
         return
+    if source_key in (None, ""):
+        raise RuntimeError(f"cannot write {src.qualified} status without a source key")
     fields: dict[str, Any] = {
         "wf_people_count": count,
         "wf_people_source": source,
@@ -389,16 +388,13 @@ def writeback_people(
         fields["wf_email_pattern_conf"] = email_pattern_confidence
     for forbidden in FORBIDDEN_WRITE:
         fields.pop(forbidden, None)
-    try:
-        supabase_sync.rpc(
-            "ew_patch_source",
-            {
-                "p_schema": src.schema,
-                "p_table": src.table,
-                "p_key_column": src.key_column,
-                "p_key": str(source_key),
-                "p_fields": fields,
-            },
-        )
-    except RuntimeError:
-        return
+    supabase_sync.rpc(
+        "ew_patch_source",
+        {
+            "p_schema": src.schema,
+            "p_table": src.table,
+            "p_key_column": src.key_column,
+            "p_key": str(source_key),
+            "p_fields": fields,
+        },
+    )
