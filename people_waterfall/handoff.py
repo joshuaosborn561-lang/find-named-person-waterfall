@@ -36,7 +36,9 @@ def handoff_title_matches(profile: ClientProfile) -> dict[str, Any]:
     Non-builtin client tags 404 unless the email service has created
     public.{tag}_wf_contacts. Call ensure_client first, then enrich.
     """
-    source_table = f"public.{profile.contacts_table}"
+    source_table = profile.contacts_table
+    if "." not in source_table:
+        source_table = f"public.{source_table}"
     where = "title_match is not null"
     payload = {
         "client_tag": profile.client_tag,

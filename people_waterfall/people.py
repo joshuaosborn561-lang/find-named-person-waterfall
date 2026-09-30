@@ -238,6 +238,7 @@ class PersonHit:
     is_current: bool | None = None
     email: str = ""
     rejection_reason: str = ""
+    title_rank: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

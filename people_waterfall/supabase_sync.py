@@ -179,12 +179,14 @@ def rest_upsert(
     rows: list[dict[str, Any]],
     *,
     on_conflict: str,
+    batch_size: int = BATCH_SIZE,
 ) -> int:
     if not rows:
         return 0
+    size = max(1, int(batch_size or BATCH_SIZE))
     written = 0
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
+    for i in range(0, len(rows), size):
+        batch = rows[i : i + size]
         _request(
             "POST",
             f"{table}?on_conflict={on_conflict}",

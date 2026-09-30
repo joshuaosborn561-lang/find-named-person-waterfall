@@ -13,6 +13,28 @@ def test_unknown_job_is_not_an_error():
     assert public["counter"]["phase"] == "unknown"
 
 
+def test_discolike_task_id_survives_progress_updates(tmp_path, monkeypatch):
+    from mcp_server import jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod, "JOBS_DIR", tmp_path)
+    job = jobs_mod.Job(
+        id="taskjob",
+        kind="resolve_people",
+        status="running",
+        created_at=time.time(),
+        meta={},
+        result={"status": "running"},
+    )
+    with jobs_mod._lock:
+        jobs_mod._jobs[job.id] = job
+    jobs_mod.remember_discolike_task(job.id, "c059d0fa-2ed2-42f9-98fe-ce9850bcfa47")
+    jobs_mod.update_job_progress(job.id, {"status": "running", "input_rows": 1, "counter": {"done": 0}})
+    public = jobs_mod.get_job(job.id).to_public()
+    assert public["discolike_task_id"] == "c059d0fa-2ed2-42f9-98fe-ce9850bcfa47"
+    assert public["meta"]["discolike_task_id"] == "c059d0fa-2ed2-42f9-98fe-ce9850bcfa47"
+    assert public["progress"]["discolike_task_id"] == "c059d0fa-2ed2-42f9-98fe-ce9850bcfa47"
+
+
 def test_empty_job_id_unknown():
     job = get_job("")
     assert job.status == "unknown"

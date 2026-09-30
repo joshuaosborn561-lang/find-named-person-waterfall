@@ -39,7 +39,9 @@ from .vendors.discolike import DiscoLikeClient
 from .vendors.leadmagic import LeadMagicClient
 from .vendors.leadmagic import per_credit_from_payload as lm_per_credit
 from .write import (
+    call_with_retry,
     contact_payload,
+    dedupe_person_rows,
     is_known,
     load_known_names,
     name_bank_row,
@@ -205,12 +207,49 @@ def _audit_people(
             domain=domain,
             use_fallback=use_fallback,
         )
+        if decision.audit is not None and decision.audit.title_rank is not None:
+            person.title_rank = decision.audit.title_rank
         if decision.reason:
             person.rejection_reason = decision.reason
             bank.append(person)
             continue
         accepted.append((person, decision.audit, decision.confidence))
     return accepted, bank
+
+
+def _unique_people(people: list[PersonHit]) -> list[PersonHit]:
+    """One hit per normalized name. The first occurrence wins."""
+    seen: set[str] = set()
+    out: list[PersonHit] = []
+    for person in people:
+        key = (person.name_key or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(person)
+    return out
+
+
+def adopt_sibling(primary: _CompanyWork, sibling: _CompanyWork) -> None:
+    """Copy a domain's gated result onto another source row for writeback only.
+
+    persisted_* is set to the copied length so a later flush does not bank or
+    insert the same (domain, person) again.
+    """
+    sibling.accepted_rows = list(primary.accepted_rows)
+    sibling.bank_people = list(primary.bank_people)
+    sibling.email_pattern = primary.email_pattern
+    sibling.email_pattern_confidence = primary.email_pattern_confidence
+    sibling.last_source = primary.last_source
+    sibling.reason = primary.reason or sibling.reason
+    sibling.bank_count = primary.bank_count
+    sibling.deferred = primary.deferred
+    sibling.used_fallback = primary.used_fallback
+    sibling.tiers_called.update(primary.tiers_called)
+    sibling.handled_keys.update(primary.handled_keys)
+    sibling.seen_people = list(primary.seen_people)
+    sibling.persisted_contacts = len(sibling.accepted_rows)
+    sibling.persisted_bank = len(sibling.bank_people)
 
 
 def estimate_job(
@@ -293,11 +332,15 @@ def resolve_people(
     write_supabase: bool = True,
     progress_callback: ProgressFn | None = None,
     vendors: VendorBundle | None = None,
+    on_discolike_task: Callable[[str], None] | None = None,
+    record_measured_rates: bool = True,
 ) -> dict[str, Any]:
     tag = normalize_client_tag(client_tag)
     profile = get_profile(tag)
     src = parse_source(source_table, where, writeback=write_supabase)
     bundle = vendors or build_vendors()
+    if on_discolike_task is not None:
+        bundle.discolike.on_task_started = on_discolike_task
     rates = read_live_rates(bundle)
     order = compute_tier_order(
         rates=rates,
@@ -482,32 +525,40 @@ def resolve_people(
             fresh_bank = work.bank_people[work.persisted_bank :]
             work.persisted_bank = len(work.bank_people)
             for person in fresh_bank:
-                bank_rows.append(
-                    name_bank_row(
-                        client_tag=tag,
-                        domain=work.domain,
-                        person=person,
-                        source=work.last_source or person.source_tier or "discolike",
-                    )
+                row = name_bank_row(
+                    client_tag=tag,
+                    domain=work.domain,
+                    person=person,
+                    source=work.last_source or person.source_tier or "discolike",
                 )
+                row["title_rank"] = person.title_rank
+                bank_rows.append(row)
             fresh_contacts = work.accepted_rows[work.persisted_contacts :]
             work.persisted_contacts = len(work.accepted_rows)
             contact_rows.extend(fresh_contacts)
-        if write_supabase and bank_rows:
-            write_name_bank_rows(bank_rows)
+        contact_rows = dedupe_person_rows(contact_rows)
+        bank_rows = dedupe_person_rows(bank_rows)
+        for row in bank_rows:
+            row.pop("title_rank", None)
+        # Contacts first, then the bank, then source status. A contacts failure
+        # stops the batch before name_bank or writeback.
         if write_supabase and contact_rows:
             stats["written"] += write_contacts(profile, contact_rows)
+        if write_supabase and bank_rows:
+            write_name_bank_rows(bank_rows)
         if write_supabase:
             for work in works:
-                writeback_people(
-                    src,
-                    work.row.get("_source_key"),
-                    count=len(work.accepted_rows),
-                    source=work.last_source or ("fallback" if work.used_fallback else ""),
-                    status=_company_status(work),
-                    reason=work.reason,
-                    email_pattern=work.email_pattern,
-                    email_pattern_confidence=work.email_pattern_confidence,
+                call_with_retry(
+                    lambda work=work: writeback_people(
+                        src,
+                        work.row.get("_source_key"),
+                        count=len(work.accepted_rows),
+                        source=work.last_source or ("fallback" if work.used_fallback else ""),
+                        status=_company_status(work),
+                        reason=work.reason,
+                        email_pattern=work.email_pattern,
+                        email_pattern_confidence=work.email_pattern_confidence,
+                    )
                 )
         if not finished:
             emit()
@@ -552,17 +603,19 @@ def resolve_people(
             if _would_defer(tier, unit, billing):
                 work.deferred = True
                 return
-            people = _call_tier(
-                tier,
-                bundle,
-                profile=profile,
-                domain=work.domain,
-                company_name=work.company,
-                city=work.city,
-                state=work.state,
-                titles=titles,
-                first_name=work.first,
-                last_name=work.last,
+            people = _unique_people(
+                _call_tier(
+                    tier,
+                    bundle,
+                    profile=profile,
+                    domain=work.domain,
+                    company_name=work.company,
+                    city=work.city,
+                    state=work.state,
+                    titles=titles,
+                    first_name=work.first,
+                    last_name=work.last,
+                )
             )
             work.tiers_called.add(tier)
             work.last_source = tier
@@ -631,35 +684,52 @@ def resolve_people(
             by_domain.setdefault(work.domain, []).append(work)
         for domain, group in by_domain.items():
             row = packed.get(domain)
-            people = list(row.people) if row else []
-            bank_only = list(row.bank_only) if row else []
+            people = _unique_people(list(row.people) if row else [])
+            people_keys = {person.name_key for person in people}
+            bank_only = [
+                person
+                for person in _unique_people(list(row.bank_only) if row else [])
+                if person.name_key not in people_keys
+            ]
             cost = float(row.cost_usd) if row else 0.0
             _tier_stat("discolike")["calls"] += 1
             _tier_stat("discolike")["people"] += len(people) + len(bank_only)
             _bill("discolike", people, unit=unit, billing=billing, cost_override=cost)
-            for work in group:
-                work.tiers_called.add("discolike")
-                work.last_source = "discolike"
-                if row and row.email_pattern:
-                    work.email_pattern = row.email_pattern
-                    work.email_pattern_confidence = row.email_pattern_confidence
-                work.seen_people.extend(people)
-                work.seen_people.extend(bank_only)
-                _apply_people(
-                    work,
-                    "discolike",
-                    [*people, *bank_only],
-                    titles=target_titles,
-                    fallback=False,
-                    source="discolike",
-                )
+            primary = group[0]
+            primary.tiers_called.add("discolike")
+            primary.last_source = "discolike"
+            if row and row.email_pattern:
+                primary.email_pattern = row.email_pattern
+                primary.email_pattern_confidence = row.email_pattern_confidence
+            primary.seen_people.extend(people)
+            primary.seen_people.extend(bank_only)
+            _apply_people(
+                primary,
+                "discolike",
+                [*people, *bank_only],
+                titles=target_titles,
+                fallback=False,
+                source="discolike",
+            )
+            for sibling in group[1:]:
+                adopt_sibling(primary, sibling)
+                sibling.tiers_called.add("discolike")
+                sibling.last_source = "discolike"
         # Write the whole DiscoLike batch before any later tier spends.
         _flush(queued, finished=False)
+
+    inflight: dict[str, _CompanyWork] = {}
+    waiting: dict[str, list[_CompanyWork]] = {}
 
     def finalize(work: _CompanyWork) -> None:
         if work.finished:
             return
         _finish(work)
+        if not work.domain or inflight.get(work.domain) is not work:
+            return
+        for sibling in waiting.pop(work.domain, []):
+            adopt_sibling(work, sibling)
+            finalize(sibling)
 
     def finalize_rest(works: list[_CompanyWork], *, as_deferred: bool = False) -> None:
         for work in works:
@@ -702,6 +772,18 @@ def resolve_people(
             before=before,
             after=after,
         )
+        if domain and domain in inflight:
+            owner = inflight[domain]
+            if owner.finished:
+                adopt_sibling(owner, work)
+                finalize(work)
+            else:
+                waiting.setdefault(domain, []).append(work)
+            if deferred:
+                break
+            continue
+        if domain:
+            inflight[domain] = work
         run_pass(work, work.before, target_titles, False)
         if work.accepted_rows or work.deferred:
             finalize(work)
@@ -842,7 +924,12 @@ def resolve_people(
         },
         "handoff": handoff,
     }
-    if write_supabase and "discolike" in stats["per_tier"] and not estimate_only:
+    if (
+        write_supabase
+        and record_measured_rates
+        and "discolike" in stats["per_tier"]
+        and not estimate_only
+    ):
         block = stats["per_tier"]["discolike"]
         calls = int(block.get("calls") or 0)
         try:
@@ -866,4 +953,72 @@ def resolve_people(
             rates.notes.append(f"measured_rates write failed: {type(exc).__name__}")
     if progress_callback:
         progress_callback({**result, "status": result["status"]})
+    return result
+
+
+def resume_discolike_task(
+    task_id: str,
+    client_tag: str,
+    source_table: str,
+    where: str = "",
+) -> dict[str, Any]:
+    """Re-read a finished DiscoLike task and run gates and writes.
+
+    GET /discogen/status/{task_id} is free. Nothing is billed again.
+    """
+    from .vendors.discolike import DiscoDomainResult, DiscoLikeClient
+
+    raw_id = (task_id or "").strip()
+    if not raw_id:
+        raise ValueError("task_id is required")
+    tag = normalize_client_tag(client_tag)
+    profile = get_profile(tag)
+    client = DiscoLikeClient()
+    payload = client.fetch_task(raw_id)
+
+    class _Replay:
+        enabled = True
+        calls = 0
+        last_error = ""
+        on_task_started = None
+
+        def resolve_domains(self, domains, **kwargs):
+            companies = kwargs.get("companies") or {}
+            parsed = client.parse_results(payload, profile=profile, companies=companies)
+            out: dict[str, DiscoDomainResult] = {}
+            hosts: list[str] = []
+            seen: set[str] = set()
+            for domain in domains:
+                host = str(domain or "").strip().lower()
+                if not host or host in seen:
+                    continue
+                seen.add(host)
+                hosts.append(host)
+            for host in hosts:
+                row = parsed.get(host) or DiscoDomainResult(domain=host)
+                row.cost_usd = 0.0
+                out[host] = row
+            self.calls += len(hosts)
+            return out
+
+    bundle = build_vendors()
+    bundle.discolike = _Replay()
+    result = resolve_people(
+        source_table=source_table,
+        where=where,
+        client_tag=tag,
+        min_tier="discolike",
+        max_tier="discolike",
+        estimate_only=False,
+        write_supabase=True,
+        vendors=bundle,
+        record_measured_rates=False,
+    )
+    result["resumed_task_id"] = raw_id
+    result["spent_usd"] = 0.0
+    result["billing"] = "free_reread"
+    counts = result.get("per_tier") or {}
+    block = counts.get("discolike") if isinstance(counts, dict) else None
+    if isinstance(block, dict):
+        block["usd"] = 0.0
     return result

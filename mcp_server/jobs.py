@@ -32,6 +32,11 @@ class Job:
         payload = asdict(self)
         payload["progress"] = self.result
         payload["counter"] = _extract_counter(self)
+        task_id = ""
+        if isinstance(self.meta, dict):
+            task_id = str(self.meta.get("discolike_task_id") or "")
+        if task_id:
+            payload["discolike_task_id"] = task_id
         return payload
 
 
@@ -260,11 +265,35 @@ def update_job_progress(job_id: str, snapshot: dict[str, Any]) -> None:
             job = get_job(job_id)
             if job.status == "unknown" and job.kind == "unknown":
                 return
+        task_id = ""
+        if isinstance(job.meta, dict):
+            task_id = str(job.meta.get("discolike_task_id") or "")
         job.result = dict(snapshot)
+        if task_id:
+            job.result.setdefault("discolike_task_id", task_id)
         if snapshot.get("status") in {"running", "deferred", "completed"}:
             # Keep runner status unless the worker already finished.
             if job.status == "running":
                 pass
+    _persist(job)
+
+
+def remember_discolike_task(job_id: str, task_id: str) -> None:
+    """Store a DiscoLike task id the moment generate returns, before polling."""
+    raw_id = (task_id or "").strip()
+    raw_job = (job_id or "").strip()
+    if not raw_id or not raw_job:
+        return
+    with _lock:
+        job = _jobs.get(raw_job)
+        if job is None:
+            return
+        meta = dict(job.meta or {})
+        meta["discolike_task_id"] = raw_id
+        job.meta = meta
+        result = dict(job.result or {})
+        result["discolike_task_id"] = raw_id
+        job.result = result
     _persist(job)
 
 
