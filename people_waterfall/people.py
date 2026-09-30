@@ -237,6 +237,7 @@ class PersonHit:
     source_confidence: float = 1.0
     is_current: bool | None = None
     email: str = ""
+    rejection_reason: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

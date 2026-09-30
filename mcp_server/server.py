@@ -54,6 +54,12 @@ def _reload_settings() -> None:
             cfg.settings = cfg.merge_private_keys(rows)
     except Exception:
         pass
+    # Vendors read the live settings object. Also mirror onto the process env
+    # so a key loaded from private.api_keys is visible to os.environ checks.
+    if cfg.settings.discolike_api_key and not os.environ.get("DISCOLIKE_API_KEY"):
+        os.environ["DISCOLIKE_API_KEY"] = cfg.settings.discolike_api_key
+    if cfg.settings.leadmagic_api_key and not os.environ.get("LEADMAGIC_API_KEY"):
+        os.environ["LEADMAGIC_API_KEY"] = cfg.settings.leadmagic_api_key
 
 
 TOOL_NAMES = [
@@ -62,6 +68,7 @@ TOOL_NAMES = [
     "get_profile",
     "get_job_status",
     "list_jobs",
+    "regate_name_bank",
 ]
 
 
@@ -233,6 +240,31 @@ def list_jobs(limit: int = 20) -> str:
     from mcp_server.jobs import list_jobs as _list
 
     return _json([j.to_public() for j in _list(limit=limit)])
+
+
+@mcp.tool(
+    name="regate_name_bank",
+    title="Regate name bank",
+    structured_output=False,
+    annotations=ToolAnnotations(
+        title="Regate name bank",
+        readOnlyHint=False,
+        openWorldHint=False,
+        destructiveHint=False,
+    ),
+)
+def regate_name_bank(client_tag: str) -> str:
+    """Re-apply the current profile gate to public.name_bank.
+
+    Promotes rows that now pass into the client's contacts table.
+    Free: no vendor calls. Rows that still fail keep a rejection_reason
+    of title, seniority, geo, or company.
+    """
+    _ensure_repo_cwd()
+    _reload_settings()
+    from people_waterfall.regate import regate_name_bank as _regate
+
+    return _json(_regate(client_tag))
 
 
 @mcp.tool(

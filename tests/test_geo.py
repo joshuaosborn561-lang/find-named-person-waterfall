@@ -18,6 +18,16 @@ def test_reject_drops_out_of_geo():
     assert apply_person_geo(person_state="MA", geo=geo).keep is True
 
 
+def test_missing_location_passes_reject_mode():
+    geo = {"states": ["CA"], "person_geo_mode": "reject"}
+    blank = apply_person_geo(person_state="", person_city="", geo=geo)
+    assert blank.keep is True
+    city_only = apply_person_geo(person_state="", person_city="Sacramento", geo=geo)
+    assert city_only.keep is True
+    away = apply_person_geo(person_state="TX", person_city="Dallas", geo=geo)
+    assert away.keep is False
+
+
 def test_ignore_skips_check():
     geo = {"states": ["TX"], "person_geo_mode": "ignore"}
     assert apply_person_geo(person_state="AK", geo=geo).keep is True

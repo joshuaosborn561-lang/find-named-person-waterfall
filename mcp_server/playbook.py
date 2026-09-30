@@ -18,7 +18,10 @@ Waterfall `ensure_profile` creates the row.
   people-tier order. `skip_tiers` is a comma list.
   DiscoLike-only: `min_tier=discolike` `max_tier=discolike`.
   Zero-pass companies are written wf_people_status=people_unresolved.
-  counter.done advances when a company is processed and written.
+  counter.done counts companies that finished every selected tier.
+  Contacts, name_bank, and wf_people_status are written after each tier
+  batch. A write error fails the job before the next tier spends.
+  A job that spent money and wrote 0 contacts fails instead of completing.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
   prices, drops zero-yield people tiers, writes `people_tier_order`. Never
   writes the domain resolver's shared `tier_order`.
@@ -37,7 +40,10 @@ default tier; it does not cheapest-sort the declared order.
 DiscoLike is the primary discovery tier. It needs a domain. One sequential
 task for the full domain list (cap 5,000; more domains run as later
 tasks, never concurrent). search_context_size=low (2 queries),
-max_contacts_per_domain=3, find_emails=false, integration_id=native.
+max_contacts_per_domain=3, find_emails=false. integration_id is
+"native" (Groove, no LLM key). search_provider_id is the account's
+Serper provider from GET /v1/search-providers.
+A selected paid tier that makes zero calls fails the job.
 icp_text comes from profile.discolike_icp_text (generated from
 target_titles + vertical on first run). Cost is
 SERPER_USD_PER_QUERY × 2 + DISCOLIKE_USD_PER_COMPANY (defaults
@@ -59,8 +65,14 @@ in resolved | partial | deferred | people_unresolved.
 
 Never touch dl_status, sg_exclude, or skip_*.
 
-Wrong titles go to public.name_bank. Every accepted person passes the company
-match (first ten characters or equal domain) and the title audit.
+Wrong titles go to public.name_bank with rejection_reason
+title, seniority, geo, or company. A title that is literally in
+target_titles is not rejected by seniority_floor. A contact with no
+city and no state passes the geo gate. regate_name_bank(client_tag)
+re-applies the current profile to banked rows and promotes passes
+into the contacts table. It does not call a vendor.
+Every accepted person passes the company match (first ten characters
+or equal domain) and the title audit.
 """
 
 WHEN_TO_USE = """Use People Waterfall when the task is "who works here in this title?"

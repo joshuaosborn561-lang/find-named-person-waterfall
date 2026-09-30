@@ -117,6 +117,9 @@ def apply_person_geo(
     default_confidence: float = 1.0,
 ) -> GeoDecision:
     geo = geo or {}
+    # No city and no state is not an out-of-geo contact.
+    if not (person_state or "").strip() and not (person_city or "").strip():
+        return GeoDecision(True, default_confidence, None)
     mode = str(geo.get("person_geo_mode") or "ignore").strip().lower()
     if mode not in {"reject", "cap", "ignore"}:
         mode = "ignore"
