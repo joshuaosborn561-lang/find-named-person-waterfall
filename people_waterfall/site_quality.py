@@ -134,6 +134,19 @@ NAME_STOPLIST = frozenset(
         "visit",
         "shop",
         "store",
+        "shul",
+        "related",
+        "whatsapp",
+        "groups",
+        "group",
+        "kidz",
+        "kids",
+        "chat",
+        "facebook",
+        "instagram",
+        "youtube",
+        "twitter",
+        "zoom",
     }
 )
 
@@ -189,6 +202,10 @@ TITLE_REJECT = frozenset(
         "section",
         "yahrzeit",
         "siyum",
+        "groups",
+        "whatsapp",
+        "related",
+        "kidz",
     }
 )
 
