@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -67,6 +68,51 @@ NAME_STOPLIST = frozenset(
         "p.m.",
         "p.m",
         "pm",
+        "in",
+        "this",
+        "section",
+        "annual",
+        "reports",
+        "email",
+        "when",
+        "what",
+        "we",
+        "believe",
+        "next",
+        "steps",
+        "mission",
+        "statement",
+        "process",
+        "application",
+        "speaker",
+        "trustees",
+        "board",
+        "directors",
+        "new",
+        "life",
+        "god",
+        "moves",
+        "ordination",
+        "saint",
+        "st",
+        "st.",
+        "january",
+        "february",
+        "march",
+        "april",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "yahrzeit",
+        "siyum",
     }
 )
 
@@ -86,6 +132,8 @@ HONORIFICS: tuple[tuple[str, str], ...] = (
     ("cantor", "Cantor"),
     ("deacon", "Deacon"),
     ("bishop", "Bishop"),
+    ("archpriest", "Father"),
+    ("archimandrite", "Father"),
     ("dr.", "Dr."),
     ("dr", "Dr."),
 )
@@ -113,6 +161,13 @@ TITLE_REJECT = frozenset(
         "welcome",
         "portal",
         "join",
+        "speaker",
+        "email",
+        "application",
+        "reports",
+        "section",
+        "yahrzeit",
+        "siyum",
     }
 )
 
@@ -343,7 +398,7 @@ def _person_from_tokens(tokens: list[str], honorific: str = "") -> ParsedPerson 
 
 
 def parse_name_line(text: str) -> list[ParsedPerson]:
-    raw = re.sub(r"\s+", " ", (text or "").strip())
+    raw = re.sub(r"\s+", " ", html.unescape(text or "").strip())
     raw = raw.strip(" -|•\t")
     if not raw or len(raw) > 80:
         return []
@@ -383,8 +438,14 @@ def parse_name_line(text: str) -> list[ParsedPerson]:
 
 
 def title_is_usable(title: str) -> bool:
-    raw = (title or "").strip()
+    raw = html.unescape((title or "").strip())
     if not raw or len(raw) > 80:
+        return False
+    if "@" in raw or _HAS_DIGIT.search(raw):
+        return False
+    if raw.count(" ") >= 8:
+        return False
+    if parse_name_line(raw):
         return False
     norm = normalize_title(raw)
     if not norm:
@@ -394,6 +455,8 @@ def title_is_usable(title: str) -> bool:
             return False
     words = [w for w in norm.split() if w]
     if words and all(w in NAME_STOPLIST or w in TITLE_REJECT for w in words):
+        return False
+    if words and words[0] in {"our", "the", "a", "an", "this"}:
         return False
     return True
 
@@ -453,6 +516,13 @@ def local_matches(local: str, first: str, last: str, honorific: str = "") -> boo
     hon = re.sub(r"[^a-z]", "", (honorific or "").lower())
     if hon and last_n:
         cands.add(hon + last_n)
+    if hon and first_n:
+        cands.add(hon + first_n)
+    for role in ROLE_LOCALS:
+        if last_n:
+            cands.add(role + last_n)
+        if first_n:
+            cands.add(role + first_n)
     return loc in cands
 
 

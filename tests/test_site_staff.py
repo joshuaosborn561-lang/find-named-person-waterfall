@@ -273,6 +273,29 @@ def test_generic_email_is_not_written_on_the_person():
     assert "religiouseducation@betheljc.org" in picked.generic_emails
 
 
+def test_heading_phrases_and_event_titles_are_rejected():
+    for raw in (
+        "In This Section",
+        "St. Mary's Annual Reports",
+        "When God Moves",
+        "What We Believe",
+        "Next Steps",
+        "Mission Statement",
+        "ORDINATION PROCESS",
+        "New Life Trustees",
+    ):
+        assert parse_name_line(raw) == [], raw
+    assert title_is_usable("Email us at: parishoffice@stmarysharlem.org or rector@stmarysharlem.org") is False
+    assert title_is_usable("Rabbi Chaim Wakslak's Second Yahrzeit Siyum, January 28, 2022") is False
+    assert title_is_usable("Speaker: Pastor Richmond Aboagye") is False
+    assert title_is_usable("Our Senior Pastor") is False
+    assert title_is_usable("Sr. Pastor") is True
+
+
+def test_pastorkeith_is_personal():
+    assert classify_email("pastorkeith@abundantlifewyckoff.org", first="Keith", last="Moody", honorific="Rev.") == "personal"
+
+
 def test_site_staff_quality_pause():
     assert should_pause_for_site_staff_quality(49, 0, 10) is False
     assert should_pause_for_site_staff_quality(50, 0, 0) is False
