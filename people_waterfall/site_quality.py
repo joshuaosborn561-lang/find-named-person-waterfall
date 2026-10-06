@@ -122,6 +122,18 @@ NAME_STOPLIST = frozenset(
         "calendar",
         "newsletter",
         "bulletin",
+        "get",
+        "involved",
+        "learn",
+        "more",
+        "read",
+        "watch",
+        "listen",
+        "subscribe",
+        "follow",
+        "visit",
+        "shop",
+        "store",
     }
 )
 
@@ -330,6 +342,8 @@ def _name_tokens_ok(tokens: list[str]) -> bool:
         key = _norm_token(token).rstrip(".")
         if key in NAME_STOPLIST or key in NAME_ROLE_WORDS:
             return False
+        if re.search(r"['’]s$", token.strip(), flags=re.I):
+            return False
         if not _token_capitalized(token):
             return False
     return True
@@ -352,6 +366,8 @@ def name_is_valid(first: str, last: str, middle: str = "") -> bool:
     if last and " " in last.strip():
         tokens = [first, *last.split(), *([middle] if middle else [])]
         tokens = [t for t in tokens if t]
+    if any(re.search(r"['’]s$", t.strip(), flags=re.I) for t in tokens):
+        return False
     return _name_tokens_ok(tokens)
 
 

@@ -285,6 +285,8 @@ def test_heading_phrases_and_event_titles_are_rejected():
         "ORDINATION PROCESS",
         "New Life Trustees",
         "Summer Programming",
+        "Get Involved",
+        "Rabbi Scheiner’s Kuntreisim",
     ):
         assert parse_name_line(raw) == [], raw
     assert title_is_usable("Email us at: parishoffice@stmarysharlem.org or rector@stmarysharlem.org") is False
