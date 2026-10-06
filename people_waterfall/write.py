@@ -75,6 +75,10 @@ def contact_payload(
         "person_city": person.person_city or None,
         "person_state": person.person_state or None,
         "email": person.email or None,
+        "email_type": person.email_type or None,
+        "page_url": person.page_url or None,
+        "source": person.source_tier or source_tier,
+        "source_url": person.page_url or None,
         "client_tag": client_tag,
         "updated_at": _now(),
         # Compatibility aliases on older wf_contacts tables.
@@ -161,10 +165,39 @@ def _contact_keys(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+_PUBLIC_CONTACT_SKIP = ("email_type", "page_url", "source", "source_url")
+
+
+def _insert_schema_contacts(schema: str, table: str, rows: list[dict[str, Any]]) -> int:
+    written = 0
+    for i in range(0, len(rows), WRITE_CHUNK):
+        chunk = rows[i : i + WRITE_CHUNK]
+
+        def _send(batch: list[dict[str, Any]] = chunk) -> int:
+            count = supabase_sync.rpc(
+                "pw_insert_contacts",
+                {"p_schema": schema, "p_table": table, "p_rows": batch},
+            )
+            return int(count or 0)
+
+        try:
+            written += int(call_with_retry(_send) or 0)
+        except Exception:
+            for row in chunk:
+                try:
+                    written += _send([row])
+                except Exception:
+                    continue
+    return written
+
+
 def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
-    table = profile.contacts_table_name
+    schema, table = split_qualified(profile.contacts_table)
+    prepared = [_contact_keys(row) for row in dedupe_person_rows(rows)]
+    if schema != "public":
+        return _insert_schema_contacts(schema, table, prepared)
     try:
         supabase_sync.rpc(
             "pw_ensure_contacts_columns",
@@ -172,9 +205,12 @@ def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
         )
     except RuntimeError:
         pass
-    prepared = [_contact_keys(row) for row in dedupe_person_rows(rows)]
+    public_rows = [
+        {key: value for key, value in row.items() if key not in _PUBLIC_CONTACT_SKIP}
+        for row in prepared
+    ]
     return _write_chunks(
-        prepared,
+        public_rows,
         lambda chunk: supabase_sync.rest_upsert(
             table,
             chunk,
@@ -191,35 +227,70 @@ def name_bank_row(
     person: PersonHit,
     source: str,
 ) -> dict[str, Any]:
+    first = (person.first_name or "").strip()
+    last = (person.last_name or "").strip()
+    reason = (person.rejection_reason or "").strip()
+    status = "wrong_title"
+    if person.name_bank_status == "needs_email":
+        status = "needs_email"
+        if not reason:
+            reason = ""
+    if first and not last:
+        last = ""
+        reason = "single_name"
+    if not reason and status != "needs_email":
+        reason = "title"
     return {
         "client_tag": client_tag,
         "domain": (domain or person.domain or "").strip().lower() or "",
-        "first_name": person.first_name or None,
-        "last_name": person.last_name or None,
+        "first_name": first,
+        "last_name": last,
         "job_title": person.title or None,
         "linkedin_url": person.linkedin_url or None,
         "source": source or person.source_tier,
-        "status": "wrong_title",
-        "rejection_reason": person.rejection_reason or "title",
+        "status": status,
+        "rejection_reason": reason or None,
     }
 
 
 def write_name_bank_rows(rows: list[dict[str, Any]]) -> int:
-    """Upsert name_bank rows. Raises on failure. Duplicate keys are merges."""
+    """Upsert name_bank rows. One bad row is counted and skipped."""
     if not rows:
         return 0
     prepared = []
     for row in dedupe_person_rows(rows):
-        prepared.append({k: v for k, v in row.items() if k in NAME_BANK_COLUMNS})
-    return _write_chunks(
-        prepared,
-        lambda chunk: supabase_sync.rest_upsert(
+        item = {k: v for k, v in row.items() if k in NAME_BANK_COLUMNS}
+        first = str(item.get("first_name") or "").strip()
+        if not first:
+            continue
+        item["first_name"] = first
+        item["last_name"] = str(item.get("last_name") or "")
+        if item["last_name"] == "" and not item.get("rejection_reason"):
+            item["rejection_reason"] = "single_name"
+        prepared.append(item)
+
+    def _send(batch: list[dict[str, Any]]) -> int:
+        return supabase_sync.rest_upsert(
             "name_bank",
-            chunk,
+            batch,
             on_conflict="client_tag,domain,first_name,last_name",
             batch_size=WRITE_CHUNK,
-        ),
-    )
+        )
+
+    written = 0
+    for i in range(0, len(prepared), WRITE_CHUNK):
+        chunk = prepared[i : i + WRITE_CHUNK]
+        try:
+            call_with_retry(lambda chunk=chunk: _send(chunk))
+            written += len(chunk)
+        except Exception:
+            for row in chunk:
+                try:
+                    _send([row])
+                    written += 1
+                except Exception:
+                    continue
+    return written
 
 
 def write_name_bank(

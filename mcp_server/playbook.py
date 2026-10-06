@@ -35,9 +35,24 @@ Waterfall `ensure_profile` creates the row.
 
 ## Ordering
 
-Default people_tier_order is cache → discolike → leadmagic_employee.
-Those are the only people tiers. A receipt may drop a zero-yield
-default tier; it does not cheapest-sort the declared order.
+Default people_tier_order is site_staff → cache → discolike →
+leadmagic_employee. site_staff is free and runs first. Paid unit
+prices and the cache → discolike → leadmagic_employee order do not
+change. A receipt may drop a zero-yield default tier; it does not
+cheapest-sort the declared order.
+
+site_staff reads public.site_pages, then fetches up to 8 same-domain
+staff/team/about/contact pages. It writes one contact per domain
+(source site_staff, email_type personal|role|generic) or banks a
+title match with no email. max_tier=site_staff runs only that tier.
+
+Before any paid call the job checks the profile, source table,
+contacts table, and wf_people_* columns. Missing writeback columns
+are added, or status goes to public.wf_people_status. Contacts and
+name_bank flush every 50 companies. After 100 companies, spend above
+$0 with 0 contacts pauses the job (reason spending_without_output).
+A vendor row with only a first name is banked with last_name '' and
+rejection_reason single_name. Tool errors return {ok:false, error, stage}.
 
 DiscoLike is the primary discovery tier. It needs a domain. One sequential
 task for the full domain list (cap 5,000; more domains run as later

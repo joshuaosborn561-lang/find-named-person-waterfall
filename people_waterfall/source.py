@@ -29,6 +29,14 @@ FORBIDDEN_WRITE = frozenset(
 )
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NOT_FALSE = re.compile(
+    r"(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s+is\s+not\s+false\b",
+    re.I,
+)
+_NOT_BLANK = re.compile(
+    r"""coalesce\(\s*(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*''\s*\)\s*(?:<>|!=)\s*''""",
+    re.I | re.X,
+)
 _PRED = re.compile(
     r"""
     (?P<col>[A-Za-z_][A-Za-z0-9_]*)
@@ -77,6 +85,8 @@ class TableSource:
     column_map: dict[str, str] = field(default_factory=dict)
     limit: int | None = None
     writeback: bool = True
+    client_tag: str = ""
+    status_mode: str = "columns"
 
     @property
     def qualified(self) -> str:
@@ -131,11 +141,20 @@ def where_to_filters(where: str) -> list[dict[str, str]]:
         part = part.strip().rstrip(";")
         if not part:
             continue
+        blank = _NOT_BLANK.fullmatch(part)
+        if blank:
+            out.append({"col": blank.group("col"), "op": "not.blank"})
+            continue
+        not_false = _NOT_FALSE.fullmatch(part)
+        if not_false:
+            out.append({"col": not_false.group("col"), "op": "is.not.false"})
+            continue
         m = _PRED.fullmatch(part)
         if not m:
             raise ValueError(
                 "where only allows AND-combined predicates like "
-                "\"wf_people_status is null\" or \"wf_domain_status = 'resolved'\""
+                "\"wf_people_status is null\", \"in_icp is not false\", "
+                "\"coalesce(domain,'')<>''\", or \"wf_domain_status = 'resolved'\""
             )
         col = m.group("col")
         if m.group("null"):
@@ -304,6 +323,10 @@ def filters_to_query(filters: list[dict[str, str]]) -> dict[str, str]:
             query[col] = f"eq.{item.get('value', '')}"
         elif op == "neq":
             query[col] = f"neq.{item.get('value', '')}"
+        elif op == "is.not.false":
+            query[col] = "not.is.false"
+        elif op == "not.blank":
+            query[col] = "not.eq."
     return query
 
 
@@ -312,6 +335,8 @@ def count_source_exact(src: TableSource) -> int | None:
     try:
         filters = where_to_filters(src.where)
     except ValueError:
+        return None
+    if any(item.get("op") == "not.blank" for item in filters):
         return None
     params = {"select": src.key_column or "id"}
     params.update(filters_to_query(filters))
@@ -388,6 +413,24 @@ def writeback_people(
         fields["wf_email_pattern_conf"] = email_pattern_confidence
     for forbidden in FORBIDDEN_WRITE:
         fields.pop(forbidden, None)
+    if src.status_mode == "sidecar":
+        from datetime import datetime, timezone
+
+        supabase_sync.rest_upsert(
+            "wf_people_status",
+            [
+                {
+                    "client_tag": src.client_tag or "",
+                    "source_table": src.qualified,
+                    "source_key": str(source_key),
+                    "status": status,
+                    "reason": reason or None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+            on_conflict="client_tag,source_table,source_key",
+        )
+        return
     supabase_sync.rpc(
         "ew_patch_source",
         {
