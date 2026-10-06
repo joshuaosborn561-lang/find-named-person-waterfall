@@ -239,6 +239,7 @@ class PersonHit:
     email: str = ""
     email_type: str = ""
     page_url: str = ""
+    honorific: str = ""
     rejection_reason: str = ""
     name_bank_status: str = ""
     title_rank: int | None = None

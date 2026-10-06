@@ -12,9 +12,22 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from ..people import PersonHit, looks_like_person, split_name
+from ..people import PersonHit
 from ..profile import ClientProfile
-from ..titles import apply_synonyms, normalize_title
+from ..site_quality import (
+    bankable_person,
+    classify_email,
+    email_allowed,
+    local_matches,
+    name_is_valid,
+    parse_name_line,
+    registrable_domain,
+    same_site,
+    title_excluded,
+    title_is_usable,
+    title_phrase_rank,
+)
+from ..titles import apply_synonyms
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -60,12 +73,6 @@ GUESSED_PATHS = (
     "/about",
     "/about-us",
     "/contact",
-)
-ROLE_LOCALS = frozenset(
-    {"pastor", "rabbi", "rector", "office", "priest", "minister", "vicar", "father"}
-)
-GENERIC_LOCALS = frozenset(
-    {"info", "contact", "admin", "hello", "mail", "enquiries", "inquiries"}
 )
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 OBFUSCATED_RE = re.compile(
@@ -117,17 +124,8 @@ def extract_emails(text: str) -> list[str]:
     return found
 
 
-def _host(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host
-
-
 def _same_domain(url: str, domain: str) -> bool:
-    host = _host(url)
-    root = (domain or "").lower().lstrip(".")
-    return bool(host) and (host == root or host.endswith("." + root))
+    return same_site(url, domain)
 
 
 def _priority_score(url: str, anchor: str) -> int:
@@ -153,6 +151,15 @@ class _PageParser(HTMLParser):
         self._script_buf: list[str] = []
         self._block: dict[str, Any] | None = None
         self._block_depth = 0
+        self._line: list[str] = []
+
+    def _flush_line(self) -> None:
+        if self._block is None:
+            return
+        text = " ".join(part for part in self._line if part).strip()
+        self._line = []
+        if text:
+            self._block["text"].append(text)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = {key.lower(): (value or "") for key, value in attrs}
@@ -167,6 +174,8 @@ class _PageParser(HTMLParser):
         cf = attr.get("data-cfemail")
         if cf:
             self.cfemails.append(cf)
+        if tag in {"br", "p", "div", "li", "article", "section", "h1", "h2", "h3", "h4", "h5", "tr"}:
+            self._flush_line()
         if tag == "a":
             self._href = attr.get("href") or ""
             self._anchor = []
@@ -186,8 +195,6 @@ class _PageParser(HTMLParser):
                 self._block = {"text": [], "emails": []}
                 self._block_depth = 0
             self._block_depth += 1
-        if tag in {"h1", "h2", "h3", "h4", "h5"} and self._block is not None:
-            self._block["heading"] = True
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "noscript"} and self._skip_depth:
@@ -202,9 +209,12 @@ class _PageParser(HTMLParser):
             self.links.append((self._href, "".join(self._anchor).strip()))
             self._href = None
             self._anchor = []
+        if tag in {"p", "div", "li", "article", "section", "h1", "h2", "h3", "h4", "h5", "tr"}:
+            self._flush_line()
         if self._block is not None and tag in {"article", "li", "section", "div"}:
             self._block_depth -= 1
             if self._block_depth <= 0:
+                self._flush_line()
                 text = "\n".join(self._block["text"]).strip()
                 if text:
                     self.blocks.append({"text": text, "emails": list(self._block["emails"])})
@@ -219,7 +229,7 @@ class _PageParser(HTMLParser):
         if self._href is not None:
             self._anchor.append(data)
         if self._block is not None and data.strip():
-            self._block["text"].append(data.strip())
+            self._line.append(data.strip())
             self._block["emails"].extend(extract_emails(data))
 
 
@@ -247,30 +257,43 @@ def _walk_jsonld(node: Any, people: list[dict[str, str]]) -> None:
             _walk_jsonld(value, people)
 
 
-def _name_title_from_text(text: str) -> tuple[str, str]:
+def _people_from_lines(lines: list[str]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for index, line in enumerate(lines):
+        people = parse_name_line(line)
+        if not people:
+            continue
+        adjacent = []
+        if index > 0:
+            adjacent.append(lines[index - 1])
+        if index + 1 < len(lines):
+            adjacent.append(lines[index + 1])
+        title = ""
+        same = re.split(r"\s*[,–—|-]\s*", line, maxsplit=1)
+        if len(same) == 2 and title_is_usable(same[1]) and not parse_name_line(same[1]):
+            title = same[1].strip()
+        if not title:
+            for neighbor in adjacent:
+                if title_is_usable(neighbor) and not parse_name_line(neighbor):
+                    title = neighbor
+                    break
+        for person in people:
+            out.append(
+                {
+                    "first_name": person.first_name,
+                    "last_name": person.last_name,
+                    "honorific": person.honorific,
+                    "title": title or person.title_hint,
+                }
+            )
+    return out
+
+
+def _name_title_from_text(text: str) -> list[dict[str, str]]:
     lines = [part.strip(" -|•\t") for part in re.split(r"[\n|•]+", text) if part.strip()]
-    if not lines:
+    if not lines and text.strip():
         lines = [text.strip()]
-    name = ""
-    title = ""
-    for line in lines:
-        if len(line) > 80:
-            continue
-        first, last = split_name(line)
-        if not name and looks_like_person(first, last) and not TITLE_HINT.search(line):
-            name = f"{first} {last}".strip()
-            continue
-        if TITLE_HINT.search(line) and len(line) <= 80:
-            title = line
-            if name:
-                break
-    if not name:
-        for line in lines:
-            first, last = split_name(line)
-            if looks_like_person(first, last):
-                name = f"{first} {last}".strip()
-                break
-    return name, title
+    return _people_from_lines(lines)
 
 
 _URL_TITLES = (
@@ -306,12 +329,23 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
         parser.blocks = []
     people: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
+    url_title = title_from_url(page_url)
 
-    def add(name: str, title: str, emails: list[str]) -> None:
-        first, last = split_name(name)
-        if not looks_like_person(first, last or ""):
+    def add(
+        first: str,
+        last: str,
+        title: str,
+        emails: list[str],
+        honorific: str = "",
+    ) -> None:
+        if not name_is_valid(first, last):
             return
-        key = (first.lower(), (last or "").lower(), (title or "").lower())
+        chosen_title = title if title_is_usable(title) else (honorific and title_is_usable(honorific) and honorific) or ""
+        if not chosen_title and url_title and title_is_usable(url_title):
+            chosen_title = url_title
+        if not chosen_title:
+            return
+        key = (first.lower(), last.lower(), chosen_title.lower())
         if key in seen:
             return
         seen.add(key)
@@ -319,18 +353,24 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
             {
                 "first_name": first,
                 "last_name": last,
-                "title": title,
+                "honorific": honorific,
+                "title": chosen_title,
                 "emails": emails,
                 "page_url": page_url,
             }
         )
 
     for block in parser.blocks:
-        name, title = _name_title_from_text(block["text"])
         emails = list(block.get("emails") or [])
         emails.extend(extract_emails(block["text"]))
-        if name:
-            add(name, title or title_from_url(page_url), emails)
+        for item in _name_title_from_text(block["text"]):
+            add(
+                item["first_name"],
+                item["last_name"],
+                item.get("title") or "",
+                emails,
+                item.get("honorific") or "",
+            )
     plain = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html or "")
     for cf in re.findall(r'data-cfemail=["\']([0-9a-fA-F]+)["\']', html or ""):
         decoded = decode_cfemail(cf)
@@ -340,17 +380,19 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
         plain += " " + href
     plain = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h[1-6]>|</tr>", "\n", plain)
     plain = re.sub(r"<[^>]+>", " ", plain)
-    for match in OBFUSCATED_RE.findall(plain):
-        plain += f" {match[0]}@{match[1]}.{match[2]}"
-    chunks = [chunk.strip() for chunk in re.split(r"\n+", plain) if chunk.strip()]
-    window: list[str] = []
-    for chunk in chunks:
-        window.append(chunk)
-        window = window[-4:]
-        blob = " ".join(window)
-        name, title = _name_title_from_text(blob)
-        if name and (title or title_from_url(page_url)):
-            add(name, title or title_from_url(page_url), extract_emails(blob))
+    lines = [chunk.strip() for chunk in re.split(r"\n+", plain) if chunk.strip()]
+    for index, line in enumerate(lines):
+        prev_line = lines[index - 1] if index else ""
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        blob = "\n".join(part for part in (prev_line, line, next_line) if part)
+        for item in _people_from_lines([prev_line, line, next_line] if (prev_line or next_line) else [line]):
+            add(
+                item["first_name"],
+                item["last_name"],
+                item.get("title") or "",
+                extract_emails(blob),
+                item.get("honorific") or "",
+            )
     for blob in parser.ldjson:
         try:
             payload = json.loads(blob)
@@ -360,61 +402,28 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
         _walk_jsonld(payload, found)
         for item in found:
             email = item.get("email") or ""
-            add(item.get("name") or "", item.get("title") or "", extract_emails(email) or ([email] if "@" in email else []))
+            parsed = parse_name_line(item.get("name") or "")
+            if not parsed:
+                continue
+            person = parsed[0]
+            add(
+                person.first_name,
+                person.last_name,
+                item.get("title") or person.title_hint,
+                extract_emails(email) or ([email] if "@" in email else []),
+                person.honorific,
+            )
     return people
 
 
-def local_matches(local: str, first: str, last: str) -> bool:
-    loc = re.sub(r"[^a-z0-9]", "", (local or "").lower())
-    first_n = re.sub(r"[^a-z]", "", (first or "").lower())
-    last_n = re.sub(r"[^a-z]", "", (last or "").lower())
-    if not loc or not first_n:
-        return False
-    cands = {first_n}
-    if last_n:
-        cands.update(
-            {
-                first_n + last_n,
-                first_n[:1] + last_n,
-                first_n + last_n[:1],
-            }
-        )
-    return loc in cands
-
-
-def _excluded(title: str, profile: ClientProfile) -> bool:
-    norm = normalize_title(apply_synonyms(title, profile.title_synonyms))
-    if not norm:
-        return False
-    for raw in profile.exclude_titles:
-        excluded = normalize_title(apply_synonyms(raw, profile.title_synonyms))
-        if excluded and (excluded == norm or excluded in norm):
-            return True
-    return False
-
-
 def _rank(title: str, profile: ClientProfile) -> int | None:
-    priority = profile.title_priority or profile.target_titles
-    norm = normalize_title(apply_synonyms(title, profile.title_synonyms))
-    if not norm or not priority:
+    if title_excluded(title, profile.exclude_titles):
         return None
-    best: int | None = None
-    for index, raw in enumerate(priority):
-        cand = normalize_title(apply_synonyms(raw, profile.title_synonyms))
-        if cand and (cand == norm or cand in norm):
-            if best is None or index < best:
-                best = index
-    return best
-
-
-def _email_kind(email: str) -> str:
-    local = email.split("@", 1)[0].lower()
-    local = re.sub(r"[^a-z]", "", local)
-    if local in ROLE_LOCALS:
-        return "role"
-    if local in GENERIC_LOCALS:
-        return "generic"
-    return "personal"
+    return title_phrase_rank(
+        title,
+        list(profile.title_priority or profile.target_titles),
+        profile.title_synonyms,
+    )
 
 
 @dataclass
@@ -424,6 +433,7 @@ class SiteDomainResult:
     email_type: str = ""
     bank_only: bool = False
     page_url: str = ""
+    generic_emails: list[str] = field(default_factory=list)
 
 
 def pick_contact(
@@ -433,55 +443,65 @@ def pick_contact(
     domain: str,
     company_name: str = "",
     domain_emails: list[str] | None = None,
+    allowed_email_domains: set[str] | None = None,
 ) -> SiteDomainResult:
-    """One title-matched person per domain. Role mail only if no personal mail."""
+    """One title-matched person per domain. Generic mail stays on the company."""
+    allowed = set(allowed_email_domains or [])
+    allowed.add(registrable_domain(domain))
     ranked: list[tuple[int, dict[str, Any]]] = []
     for cand in candidates:
+        first = str(cand.get("first_name") or "")
+        last = str(cand.get("last_name") or "")
         title = str(cand.get("title") or "")
-        if _excluded(title, profile):
+        if not bankable_person(first, last, title):
             continue
         rank = _rank(title, profile)
         if rank is None:
             continue
         ranked.append((rank, cand))
+    generic_all = [
+        str(email).lower()
+        for email in (domain_emails or [])
+        if email and email_allowed(email, allowed)
+    ]
     if not ranked:
-        return SiteDomainResult(domain=domain)
-    complete = [item for item in ranked if str(item[1].get("last_name") or "").strip()]
-    ranked = complete or ranked
+        return SiteDomainResult(
+            domain=domain,
+            generic_emails=[
+                email
+                for email in generic_all
+                if classify_email(email) == "generic"
+            ],
+        )
     ranked.sort(key=lambda item: item[0])
     best_rank = ranked[0][0]
     top = [cand for rank, cand in ranked if rank == best_rank]
     chosen = top[0]
-    emails = []
-    for cand in top:
-        for email in cand.get("emails") or []:
-            if email and email not in emails:
-                emails.append(str(email).lower())
-    # Also consider emails that sit on the chosen card only when top is one person.
-    personal = []
-    role = []
-    generic = []
     first = str(chosen.get("first_name") or "")
     last = str(chosen.get("last_name") or "")
+    honorific = str(chosen.get("honorific") or "")
+    emails: list[str] = []
+    for cand in top:
+        for email in cand.get("emails") or []:
+            raw = str(email).lower()
+            if raw and raw not in emails and email_allowed(raw, allowed):
+                emails.append(raw)
     pool = list(emails)
     for email in domain_emails or []:
-        if email not in pool:
-            pool.append(email)
+        raw = str(email).lower()
+        if raw and raw not in pool and email_allowed(raw, allowed):
+            pool.append(raw)
+    personal: list[str] = []
+    role: list[str] = []
+    generic: list[str] = []
     for email in pool:
-        kind = _email_kind(email)
-        local = email.split("@", 1)[0]
-        if kind == "personal" and (
-            local_matches(local, first, last) or email in (chosen.get("emails") or [])
-        ):
+        kind = classify_email(email, first=first, last=last, honorific=honorific)
+        if kind == "personal":
             personal.append(email)
         elif kind == "role":
             role.append(email)
-        elif kind == "generic":
+        else:
             generic.append(email)
-        elif kind == "personal" and (
-            local_matches(local, first, last) or email in (chosen.get("emails") or [])
-        ):
-            personal.append(email)
     email = ""
     email_type = ""
     if personal:
@@ -490,14 +510,12 @@ def pick_contact(
     elif role:
         email = role[0]
         email_type = "role"
-    elif generic:
-        email = generic[0]
-        email_type = "generic"
     person = PersonHit(
         first_name=first,
         last_name=last,
         full_name=f"{first} {last}".strip(),
         title=apply_synonyms(str(chosen.get("title") or ""), profile.title_synonyms),
+        honorific=honorific,
         domain=domain,
         company_name=company_name,
         email=email,
@@ -508,16 +526,6 @@ def pick_contact(
         title_rank=best_rank,
         is_current=None,
     )
-    if not last.strip():
-        person.rejection_reason = "single_name"
-        person.name_bank_status = "needs_email" if not email else ""
-        return SiteDomainResult(
-            domain=domain,
-            person=person,
-            email_type="",
-            bank_only=True,
-            page_url=person.page_url,
-        )
     if not email:
         person.name_bank_status = "needs_email"
         return SiteDomainResult(
@@ -526,6 +534,7 @@ def pick_contact(
             email_type="",
             bank_only=True,
             page_url=person.page_url,
+            generic_emails=generic,
         )
     return SiteDomainResult(
         domain=domain,
@@ -533,6 +542,7 @@ def pick_contact(
         email_type=email_type,
         bank_only=False,
         page_url=person.page_url,
+        generic_emails=generic,
     )
 
 
@@ -584,24 +594,30 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
         root = root[4:]
     if not root:
         return SiteDomainResult(domain=domain)
+    allowed_email = {registrable_domain(root)}
+    site_roots = {registrable_domain(root)}
+
+    def on_site(url: str) -> bool:
+        return any(same_site(url, item) for item in site_roots if item)
+
     candidates: list[dict[str, Any]] = []
     domain_emails: list[str] = []
-    for row in _cached_pages(root):
-        body = str(row.get("body_text") or "")
-        page = str(row.get("url") or "")
-        if body:
-            candidates.extend(parse_html(body, page_url=page))
-        for email in row.get("emails") or []:
-            if isinstance(email, str) and candidates:
-                candidates[-1].setdefault("emails", []).append(email.lower())
     homepage_html = ""
     base = ""
     for scheme in ("https", "http"):
-        final, html = _fetch(f"{scheme}://{root}/")
-        if html and _same_domain(final or f"{scheme}://{root}/", root):
-            homepage_html = html
-            base = final or f"{scheme}://{root}/"
-            break
+        requested = f"{scheme}://{root}/"
+        final, html = _fetch(requested)
+        if not html:
+            continue
+        landing = final or requested
+        land_root = registrable_domain(landing)
+        if land_root and land_root not in site_roots:
+            # Homepage of the source domain redirected to its canonical host.
+            allowed_email.add(land_root)
+            site_roots.add(land_root)
+        homepage_html = html
+        base = landing
+        break
     pages: list[tuple[str, str]] = []
     if homepage_html:
         pages.append((base, homepage_html))
@@ -614,7 +630,7 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
         seen_urls: set[str] = set()
         for href, anchor in parser.links:
             absolute = urljoin(base, href)
-            if not _same_domain(absolute, root):
+            if not on_site(absolute):
                 continue
             clean = absolute.split("#")[0]
             if clean in seen_urls:
@@ -629,23 +645,40 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
         if len(extras) < MAX_EXTRA_PAGES:
             for path in GUESSED_PATHS:
                 guess = urljoin(base, path)
-                if guess not in seen_urls and _same_domain(guess, root):
+                if guess not in seen_urls and on_site(guess):
                     extras.append(guess)
                     seen_urls.add(guess)
                 if len(extras) >= MAX_EXTRA_PAGES:
                     break
         for url in extras[:MAX_EXTRA_PAGES]:
+            if not on_site(url):
+                continue
             final, html = _fetch(url)
-            if html and _same_domain(final or url, root):
-                pages.append((final or url, html))
+            landing = final or url
+            if html and on_site(landing):
+                pages.append((landing, html))
+    for row in _cached_pages(root):
+        body = str(row.get("body_text") or "")
+        page = str(row.get("url") or "")
+        if page and not on_site(page):
+            continue
+        if body:
+            candidates.extend(parse_html(body, page_url=page))
+        for email in row.get("emails") or []:
+            if not isinstance(email, str) or not email_allowed(email, allowed_email):
+                continue
+            if candidates:
+                candidates[-1].setdefault("emails", []).append(email.lower())
+            if email.lower() not in domain_emails:
+                domain_emails.append(email.lower())
     for page_url, html in pages:
         candidates.extend(parse_html(html, page_url=page_url))
         for email in extract_emails(html):
-            if email not in domain_emails:
+            if email not in domain_emails and email_allowed(email, allowed_email):
                 domain_emails.append(email)
         for href in re.findall(r'href=["\']mailto:([^"\'?\s]+)', html or "", flags=re.I):
             email = href.strip().lower()
-            if email and email not in domain_emails:
+            if email and email not in domain_emails and email_allowed(email, allowed_email):
                 domain_emails.append(email)
     for cand in candidates:
         if cand.get("emails"):
@@ -653,10 +686,12 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
         matched = [
             email
             for email in domain_emails
-            if local_matches(
+            if email_allowed(email, allowed_email)
+            and local_matches(
                 email.split("@", 1)[0],
                 str(cand.get("first_name") or ""),
                 str(cand.get("last_name") or ""),
+                str(cand.get("honorific") or ""),
             )
         ]
         if matched:
@@ -668,6 +703,7 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
             domain=root,
             company_name=company_name,
             domain_emails=domain_emails,
+            allowed_email_domains=allowed_email,
         )
     except Exception:
         return SiteDomainResult(domain=root)
