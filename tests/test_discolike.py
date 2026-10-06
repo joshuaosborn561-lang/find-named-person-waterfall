@@ -178,6 +178,7 @@ def _run(monkeypatch, rows, vendors, **kwargs):
     from people_waterfall import waterfall as wf
 
     src = TableSource(project_id="x", schema="public", table="emcor_companies", writeback=False)
+    monkeypatch.setattr(wf, "preflight_job", lambda **k: {"ok": True, "writeback": "columns"})
     monkeypatch.setattr(wf, "get_profile", lambda tag: PROFILE)
     monkeypatch.setattr(wf, "parse_source", lambda *a, **k: src)
     monkeypatch.setattr(wf, "count_source", lambda s: len(rows))
@@ -221,7 +222,7 @@ def test_estimate_only_emcor_unresolved_selects_and_prices_discolike(monkeypatch
     assert result["estimate_only"] is True
     assert result["source_table"] == "public.emcor_companies"
     assert "discolike" in result["selected_tiers"]
-    assert result["selected_tiers"] == ["cache", "discolike", "leadmagic_employee"]
+    assert result["selected_tiers"] == ["site_staff", "cache", "discolike", "leadmagic_employee"]
     disco = next(t for t in result["tiers"] if t["tier"] == "discolike")
     assert disco["rows"] == 2
     assert disco["estimated_usd"] == pytest.approx(0.0055 * 2)

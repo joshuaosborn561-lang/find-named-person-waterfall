@@ -20,7 +20,7 @@ JOBS_DIR = ROOT / "data" / "jobs"
 class Job:
     id: str
     kind: str
-    status: str  # queued | running | completed | deferred | failed | unknown
+    status: str  # queued | running | completed | deferred | paused | failed | unknown
     created_at: float
     started_at: float | None = None
     finished_at: float | None = None
@@ -37,6 +37,23 @@ class Job:
             task_id = str(self.meta.get("discolike_task_id") or "")
         if task_id:
             payload["discolike_task_id"] = task_id
+        blob = self.result if isinstance(self.result, dict) else {}
+        progress = blob.get("progress") if isinstance(blob.get("progress"), dict) else {}
+        counts = blob.get("counts") if isinstance(blob.get("counts"), dict) else {}
+
+        def _live(*keys: str, default: Any = 0) -> Any:
+            for src in (blob, progress, counts):
+                for key in keys:
+                    if key in src and src[key] is not None:
+                        return src[key]
+            return default
+
+        payload["spent_usd"] = _live("spent_usd")
+        payload["contacts_written"] = _live("contacts_written", "written")
+        payload["title_matched"] = _live("title_matched")
+        payload["companies_done"] = _live("companies_done", "companies")
+        if blob.get("pause_reason"):
+            payload["pause_reason"] = blob.get("pause_reason")
         return payload
 
 
@@ -112,7 +129,7 @@ def _extract_counter(job: Job) -> dict[str, Any]:
             or ((base.get("resolved") or 0) + (base.get("partial") or 0))
         )
         unresolved = int(base.get("people_unresolved") or base.get("companies_unresolved") or 0)
-    phase = job.status if job.status in {"queued", "running", "completed", "failed", "deferred", "unknown"} else "running"
+    phase = job.status if job.status in {"queued", "running", "completed", "failed", "deferred", "paused", "unknown"} else "running"
     if job.status == "queued":
         done = 0
         phase = "queued"
@@ -271,7 +288,7 @@ def update_job_progress(job_id: str, snapshot: dict[str, Any]) -> None:
         job.result = dict(snapshot)
         if task_id:
             job.result.setdefault("discolike_task_id", task_id)
-        if snapshot.get("status") in {"running", "deferred", "completed"}:
+        if snapshot.get("status") in {"running", "deferred", "paused", "completed"}:
             # Keep runner status unless the worker already finished.
             if job.status == "running":
                 pass
@@ -346,7 +363,7 @@ def start_job(
         try:
             job.result = fn(job) or {}
             status = str(job.result.get("status") or "completed")
-            job.status = status if status in {"completed", "deferred"} else "completed"
+            job.status = status if status in {"completed", "deferred", "paused"} else "completed"
         except Exception as exc:  # noqa: BLE001
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}"
