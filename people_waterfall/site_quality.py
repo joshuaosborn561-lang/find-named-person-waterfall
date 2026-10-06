@@ -147,6 +147,14 @@ NAME_STOPLIST = frozenset(
         "youtube",
         "twitter",
         "zoom",
+        "women",
+        "men",
+        "boys",
+        "girls",
+        "family",
+        "families",
+        "community",
+        "congregation",
     }
 )
 
