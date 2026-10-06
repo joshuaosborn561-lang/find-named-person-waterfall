@@ -77,6 +77,7 @@ def contact_payload(
         "email": person.email or None,
         "email_type": person.email_type or None,
         "page_url": person.page_url or None,
+        "honorific": person.honorific or None,
         "source": person.source_tier or source_tier,
         "source_url": person.page_url or None,
         "client_tag": client_tag,
@@ -165,7 +166,7 @@ def _contact_keys(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-_PUBLIC_CONTACT_SKIP = ("email_type", "page_url", "source", "source_url")
+_PUBLIC_CONTACT_SKIP = ("source", "source_url")
 
 
 def _insert_schema_contacts(schema: str, table: str, rows: list[dict[str, Any]]) -> int:
@@ -202,6 +203,13 @@ def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
         supabase_sync.rpc(
             "pw_ensure_contacts_columns",
             {"p_table": table},
+        )
+    except RuntimeError:
+        pass
+    try:
+        supabase_sync.rpc(
+            "pw_ensure_contact_quality_columns",
+            {"p_schema": schema, "p_table": table},
         )
     except RuntimeError:
         pass
@@ -261,10 +269,17 @@ def write_name_bank_rows(rows: list[dict[str, Any]]) -> int:
     for row in dedupe_person_rows(rows):
         item = {k: v for k, v in row.items() if k in NAME_BANK_COLUMNS}
         first = str(item.get("first_name") or "").strip()
+        last = str(item.get("last_name") or "").strip()
+        title = str(item.get("job_title") or "")
         if not first:
             continue
+        if str(item.get("source") or "") == "site_staff":
+            from .site_quality import bankable_person
+
+            if not bankable_person(first, last, title):
+                continue
         item["first_name"] = first
-        item["last_name"] = str(item.get("last_name") or "")
+        item["last_name"] = last
         if item["last_name"] == "" and not item.get("rejection_reason"):
             item["rejection_reason"] = "single_name"
         prepared.append(item)

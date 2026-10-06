@@ -212,7 +212,10 @@ def test_write_contacts_upserts_on_person_key(monkeypatch):
     seen: dict = {}
 
     def rpc(name, body):
-        assert name == "pw_ensure_contacts_columns"
+        assert name in {
+            "pw_ensure_contacts_columns",
+            "pw_ensure_contact_quality_columns",
+        }
         assert body["p_table"] == "emcor_wf_contacts"
 
     def upsert(table, rows, *, on_conflict, batch_size=200):

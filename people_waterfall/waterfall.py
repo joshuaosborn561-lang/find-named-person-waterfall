@@ -35,6 +35,11 @@ from .source import (
     writeback_people,
 )
 from .preflight import preflight_job
+from .site_quality import (
+    bankable_person,
+    name_is_valid,
+    should_pause_for_site_staff_quality,
+)
 from .vendors.cache import CacheClient
 from .vendors.discolike import DiscoLikeClient
 from .vendors.leadmagic import LeadMagicClient
@@ -423,6 +428,9 @@ def resolve_people(
             "role": 0,
             "generic": 0,
             "banked_no_email": 0,
+            "quality_domains": 0,
+            "quality_written": 0,
+            "quality_valid": 0,
         },
         "per_tier": {t: {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0} for t in allowed},
     }
@@ -799,6 +807,21 @@ def resolve_people(
         emit()
         return False
 
+    def _check_site_staff_quality(block: dict[str, Any]) -> bool:
+        nonlocal deferred, pause_reason
+        block["quality_domains"] = int(block.get("quality_domains") or 0) + 1
+        if not should_pause_for_site_staff_quality(
+            int(block["quality_domains"]),
+            int(block.get("quality_valid") or 0),
+            int(block.get("quality_written") or 0),
+        ):
+            return False
+        deferred = True
+        pause_reason = "site_staff_quality"
+        stats["pause_reason"] = pause_reason
+        emit("paused")
+        return True
+
     def run_site_staff_batch(works: list[_CompanyWork]) -> None:
         targets = [
             work
@@ -828,21 +851,26 @@ def resolve_people(
                 primary.tiers_called.add("site_staff")
                 block["domains"] += 1
                 _tier_stat("site_staff")["calls"] += 1
+                if result and result.generic_emails:
+                    primary.email_pattern = ",".join(result.generic_emails[:5])
+                    primary.email_pattern_confidence = 1.0
+                    block["generic"] += len(result.generic_emails)
                 person = result.person if result else None
                 if person is None:
                     for sibling in group[1:]:
                         sibling.tiers_called.add("site_staff")
+                    _check_site_staff_quality(block)
+                    continue
+                if not bankable_person(person.first_name, person.last_name, person.title):
+                    for sibling in group[1:]:
+                        sibling.tiers_called.add("site_staff")
+                    _check_site_staff_quality(block)
                     continue
                 _tier_stat("site_staff")["people"] += 1
                 _bill("site_staff", [person], unit=0.0, billing="free")
-                single = not (person.last_name or "").strip()
-                if single or result.bank_only:
-                    if single:
-                        person.last_name = ""
-                        person.rejection_reason = "single_name"
-                    else:
-                        person.name_bank_status = "needs_email"
-                        person.rejection_reason = ""
+                if result.bank_only:
+                    person.name_bank_status = "needs_email"
+                    person.rejection_reason = ""
                     person.domain = domain
                     person.company_name = primary.company
                     person.source_tier = "site_staff"
@@ -855,9 +883,9 @@ def resolve_people(
                     primary.last_source = "site_staff"
                     primary.people_found = True
                     block["title_matched"] += 1
-                    if not single:
-                        block["banked_no_email"] += 1
+                    block["banked_no_email"] += 1
                 else:
+                    before = len(primary.accepted_rows)
                     _apply_people(
                         primary,
                         "site_staff",
@@ -871,8 +899,15 @@ def resolve_people(
                         primary.last_source = "site_staff"
                         block["title_matched"] += 1
                         kind = result.email_type or "personal"
-                        if kind in {"personal", "role", "generic"}:
+                        if kind in {"personal", "role"}:
                             block[kind] += 1
+                        for row in primary.accepted_rows[before:]:
+                            block["quality_written"] += 1
+                            if name_is_valid(
+                                str(row.get("first_name") or ""),
+                                str(row.get("last_name") or ""),
+                            ):
+                                block["quality_valid"] += 1
                 for sibling in group[1:]:
                     adopt_sibling(primary, sibling)
                     sibling.tiers_called.add("site_staff")
@@ -880,6 +915,8 @@ def resolve_people(
             except Exception:
                 stats["row_failures"] += 1
                 continue
+            if _check_site_staff_quality(block):
+                break
         _flush(targets, finished=False)
 
     def finalize(work: _CompanyWork) -> None:

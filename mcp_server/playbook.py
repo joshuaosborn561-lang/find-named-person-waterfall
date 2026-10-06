@@ -41,18 +41,27 @@ prices and the cache → discolike → leadmagic_employee order do not
 change. A receipt may drop a zero-yield default tier; it does not
 cheapest-sort the declared order.
 
-site_staff reads public.site_pages, then fetches up to 8 same-domain
-staff/team/about/contact pages. It writes one contact per domain
-(source site_staff, email_type personal|role|generic) or banks a
-title match with no email. max_tier=site_staff runs only that tier.
+site_staff reads public.site_pages, then fetches up to 8 same-site
+staff/team/about/contact pages (registrable domain match; www and
+subdomains allowed). Off-site links are dropped. Emails must be on
+the source domain or the homepage canonical/redirect. Names must be
+2–4 capitalized tokens after honorifics are stripped; nav/heading
+stoplist tokens are rejected. Titles come from the same staff card
+or the adjacent line only. Generic inboxes (office, info, treasurer)
+stay on the company row (`wf_email_pattern`); they are never a
+contact email. name_bank only stores a valid name plus a usable
+title. After the first 50 domains, if under 80% of written contacts
+have valid names the job pauses (`site_staff_quality`).
+max_tier=site_staff runs only that tier.
 
 Before any paid call the job checks the profile, source table,
 contacts table, and wf_people_* columns. Missing writeback columns
 are added, or status goes to public.wf_people_status. Contacts and
 name_bank flush every 50 companies. After 100 companies, spend above
 $0 with 0 contacts pauses the job (reason spending_without_output).
-A vendor row with only a first name is banked with last_name '' and
-rejection_reason single_name. Tool errors return {ok:false, error, stage}.
+A paid-vendor row with only a first name is banked with last_name ''
+and rejection_reason single_name. site_staff never banks those.
+Tool errors return {ok:false, error, stage}.
 
 DiscoLike is the primary discovery tier. It needs a domain. One sequential
 task for the full domain list (cap 5,000; more domains run as later
