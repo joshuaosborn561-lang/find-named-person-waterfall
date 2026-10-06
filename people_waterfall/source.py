@@ -296,6 +296,8 @@ def iter_source(src: TableSource) -> Any:
         if remaining is not None:
             page_src = TableSource(**{**src.__dict__, "limit": min(remaining, PAGE_SIZE)})
         rows = fetch_page(page_src, cursor=cursor)
+        src.key_column = page_src.key_column
+        src.column_map = dict(page_src.column_map)
         if not rows:
             break
         for row in rows:

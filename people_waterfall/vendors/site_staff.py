@@ -33,6 +33,10 @@ PRIORITY = (
     "clergy",
     "pastors",
     "our-pastor",
+    "pastor",
+    "minister",
+    "priest",
+    "rector",
     "ministers",
     "rabbi",
     "our-rabbi",
@@ -269,6 +273,29 @@ def _name_title_from_text(text: str) -> tuple[str, str]:
     return name, title
 
 
+_URL_TITLES = (
+    ("senior-pastor", "Senior Pastor"),
+    ("lead-pastor", "Lead Pastor"),
+    ("executive-pastor", "Executive Pastor"),
+    ("our-pastor", "Pastor"),
+    ("our-rabbi", "Rabbi"),
+    ("pastor", "Pastor"),
+    ("rabbi", "Rabbi"),
+    ("rector", "Rector"),
+    ("minister", "Minister"),
+    ("priest", "Priest"),
+    ("clergy", "Pastor"),
+)
+
+
+def title_from_url(url: str) -> str:
+    path = (urlparse(url).path or "").lower().replace("_", "-")
+    for token, title in _URL_TITLES:
+        if token in path:
+            return title
+    return ""
+
+
 def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
     """Return candidate people from one page. Each has name, title, emails, page_url."""
     parser = _PageParser()
@@ -303,7 +330,7 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
         emails = list(block.get("emails") or [])
         emails.extend(extract_emails(block["text"]))
         if name:
-            add(name, title, emails)
+            add(name, title or title_from_url(page_url), emails)
     plain = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html or "")
     for cf in re.findall(r'data-cfemail=["\']([0-9a-fA-F]+)["\']', html or ""):
         decoded = decode_cfemail(cf)
@@ -322,8 +349,8 @@ def parse_html(html: str, *, page_url: str = "") -> list[dict[str, Any]]:
         window = window[-4:]
         blob = " ".join(window)
         name, title = _name_title_from_text(blob)
-        if name and title:
-            add(name, title, extract_emails(blob))
+        if name and (title or title_from_url(page_url)):
+            add(name, title or title_from_url(page_url), extract_emails(blob))
     for blob in parser.ldjson:
         try:
             payload = json.loads(blob)
@@ -405,6 +432,7 @@ def pick_contact(
     *,
     domain: str,
     company_name: str = "",
+    domain_emails: list[str] | None = None,
 ) -> SiteDomainResult:
     """One title-matched person per domain. Role mail only if no personal mail."""
     ranked: list[tuple[int, dict[str, Any]]] = []
@@ -418,6 +446,8 @@ def pick_contact(
         ranked.append((rank, cand))
     if not ranked:
         return SiteDomainResult(domain=domain)
+    complete = [item for item in ranked if str(item[1].get("last_name") or "").strip()]
+    ranked = complete or ranked
     ranked.sort(key=lambda item: item[0])
     best_rank = ranked[0][0]
     top = [cand for rank, cand in ranked if rank == best_rank]
@@ -433,7 +463,11 @@ def pick_contact(
     generic = []
     first = str(chosen.get("first_name") or "")
     last = str(chosen.get("last_name") or "")
-    for email in emails:
+    pool = list(emails)
+    for email in domain_emails or []:
+        if email not in pool:
+            pool.append(email)
+    for email in pool:
         kind = _email_kind(email)
         local = email.split("@", 1)[0]
         if kind == "personal" and (
@@ -444,7 +478,9 @@ def pick_contact(
             role.append(email)
         elif kind == "generic":
             generic.append(email)
-        elif kind == "personal" and email in (chosen.get("emails") or []):
+        elif kind == "personal" and (
+            local_matches(local, first, last) or email in (chosen.get("emails") or [])
+        ):
             personal.append(email)
     email = ""
     email_type = ""
@@ -549,6 +585,7 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
     if not root:
         return SiteDomainResult(domain=domain)
     candidates: list[dict[str, Any]] = []
+    domain_emails: list[str] = []
     for row in _cached_pages(root):
         body = str(row.get("body_text") or "")
         page = str(row.get("url") or "")
@@ -603,8 +640,35 @@ def resolve_domain(domain: str, profile: ClientProfile, company_name: str = "") 
                 pages.append((final or url, html))
     for page_url, html in pages:
         candidates.extend(parse_html(html, page_url=page_url))
+        for email in extract_emails(html):
+            if email not in domain_emails:
+                domain_emails.append(email)
+        for href in re.findall(r'href=["\']mailto:([^"\'?\s]+)', html or "", flags=re.I):
+            email = href.strip().lower()
+            if email and email not in domain_emails:
+                domain_emails.append(email)
+    for cand in candidates:
+        if cand.get("emails"):
+            continue
+        matched = [
+            email
+            for email in domain_emails
+            if local_matches(
+                email.split("@", 1)[0],
+                str(cand.get("first_name") or ""),
+                str(cand.get("last_name") or ""),
+            )
+        ]
+        if matched:
+            cand["emails"] = matched
     try:
-        return pick_contact(candidates, profile, domain=root, company_name=company_name)
+        return pick_contact(
+            candidates,
+            profile,
+            domain=root,
+            company_name=company_name,
+            domain_emails=domain_emails,
+        )
     except Exception:
         return SiteDomainResult(domain=root)
 

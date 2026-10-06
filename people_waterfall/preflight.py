@@ -9,6 +9,7 @@ from .profile import ClientProfile, get_profile, normalize_client_tag
 from .source import (
     PEOPLE_WRITEBACK,
     TableSource,
+    discover_column_map,
     ensure_people_writeback,
     list_columns,
     parse_source,
@@ -67,6 +68,7 @@ def preflight_job(
         raise ToolError(f"{type(exc).__name__}: {exc}", "where") from exc
     try:
         source_cols = _columns(parsed.schema, parsed.table)
+        discover_column_map(parsed)
     except ToolError:
         raise
     except Exception as exc:  # noqa: BLE001
