@@ -113,6 +113,15 @@ NAME_STOPLIST = frozenset(
         "fourth",
         "yahrzeit",
         "siyum",
+        "summer",
+        "winter",
+        "spring",
+        "fall",
+        "programming",
+        "program",
+        "calendar",
+        "newsletter",
+        "bulletin",
     }
 )
 

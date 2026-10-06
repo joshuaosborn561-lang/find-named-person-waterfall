@@ -18,6 +18,7 @@ from people_waterfall.vendors.site_staff import (
     extract_emails,
     parse_html,
     pick_contact,
+    title_from_url,
 )
 from people_waterfall.waterfall import should_pause_for_spend
 from people_waterfall.write import name_bank_row, write_name_bank_rows
@@ -283,6 +284,7 @@ def test_heading_phrases_and_event_titles_are_rejected():
         "Mission Statement",
         "ORDINATION PROCESS",
         "New Life Trustees",
+        "Summer Programming",
     ):
         assert parse_name_line(raw) == [], raw
     assert title_is_usable("Email us at: parishoffice@stmarysharlem.org or rector@stmarysharlem.org") is False
@@ -290,6 +292,10 @@ def test_heading_phrases_and_event_titles_are_rejected():
     assert title_is_usable("Speaker: Pastor Richmond Aboagye") is False
     assert title_is_usable("Our Senior Pastor") is False
     assert title_is_usable("Sr. Pastor") is True
+    assert title_from_url(
+        "https://www.yilb.org/our-shul/rabbi-chaim-wakslaks-second-yahrzeit-siyum-january-28-2022/"
+    ) == ""
+    assert title_from_url("https://faithcc.com/our-pastor") == "Pastor"
 
 
 def test_pastorkeith_is_personal():

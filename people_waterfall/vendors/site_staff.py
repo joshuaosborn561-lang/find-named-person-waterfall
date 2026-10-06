@@ -313,8 +313,11 @@ _URL_TITLES = (
 
 def title_from_url(url: str) -> str:
     path = (urlparse(url).path or "").lower().replace("_", "-")
+    if re.search(r"\d{4}", path) or "event" in path or "yahrzeit" in path:
+        return ""
+    segments = [part for part in path.split("/") if part]
     for token, title in _URL_TITLES:
-        if token in path:
+        if token in segments:
             return title
     return ""
 
