@@ -237,7 +237,11 @@ class PersonHit:
     source_confidence: float = 1.0
     is_current: bool | None = None
     email: str = ""
+    email_type: str = ""
+    page_url: str = ""
     rejection_reason: str = ""
+    name_bank_status: str = ""
+    title_rank: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

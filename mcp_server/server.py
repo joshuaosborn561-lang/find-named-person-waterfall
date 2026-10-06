@@ -31,6 +31,23 @@ def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def _safe(stage: str, fn: Callable[[], Any]) -> str:
+    """Every tool returns ok/error/stage. Never a bare MCP failure."""
+    try:
+        data = fn()
+    except Exception as exc:  # noqa: BLE001
+        return _json(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "stage": getattr(exc, "stage", None) or stage,
+            }
+        )
+    if isinstance(data, str):
+        return data
+    return _json(data)
+
+
 def _ensure_repo_cwd() -> None:
     os.chdir(ROOT)
 
@@ -69,6 +86,7 @@ TOOL_NAMES = [
     "get_job_status",
     "list_jobs",
     "regate_name_bank",
+    "resume_discolike_task",
 ]
 
 
@@ -142,7 +160,10 @@ def resolve_people(
 
     ceiling = _approve_cost(approve_cost_usd)
 
-    def _run(progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    def _run(
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        on_task: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         return _resolve(
             source_table=source_table,
             where=where,
@@ -155,44 +176,59 @@ def resolve_people(
             require_title_match=bool(require_title_match),
             write_supabase=not estimate_only,
             progress_callback=progress,
+            on_discolike_task=on_task,
         )
 
-    if estimate_only:
-        return _json(_run())
-    if background and _http_mode():
-        from mcp_server.jobs import start_job, update_job_progress
+    def _go() -> dict[str, Any]:
+        if not estimate_only:
+            from people_waterfall.preflight import preflight_job
 
-        def worker(job: Any) -> dict[str, Any]:
-            return _run(lambda snap: update_job_progress(job.id, snap))
+            preflight_job(
+                client_tag=client_tag,
+                source_table=source_table,
+                where=where,
+                alter=True,
+            )
+        if estimate_only:
+            return _run()
+        if background and _http_mode():
+            from mcp_server.jobs import remember_discolike_task, start_job, update_job_progress
 
-        input_rows = None
-        try:
-            input_rows = count_source(parse_source(source_table, where, writeback=False))
-        except Exception:
+            def worker(job: Any) -> dict[str, Any]:
+                return _run(
+                    lambda snap: update_job_progress(job.id, snap),
+                    on_task=lambda task_id: remember_discolike_task(job.id, task_id),
+                )
+
             input_rows = None
-        job = start_job(
-            "resolve_people",
-            worker,
-            meta={
-                "client_tag": client_tag,
-                "source_table": source_table,
-                "where": where,
-                "max_tier": max_tier,
-                "min_tier": min_tier,
-                "skip_tiers": skip_tiers,
-                "input_rows": input_rows,
-            },
-        )
-        return _json(
-            {
+            try:
+                input_rows = count_source(parse_source(source_table, where, writeback=False))
+            except Exception as exc:  # noqa: BLE001
+                raise exc
+            job = start_job(
+                "resolve_people",
+                worker,
+                meta={
+                    "client_tag": client_tag,
+                    "source_table": source_table,
+                    "where": where,
+                    "max_tier": max_tier,
+                    "min_tier": min_tier,
+                    "skip_tiers": skip_tiers,
+                    "input_rows": input_rows,
+                },
+            )
+            return {
+                "ok": True,
                 "job_id": job.id,
                 "status": job.status,
                 "message": f"Poll get_job_status with job_id={job.id}.",
                 "client_tag": client_tag,
                 "counter": build_counter(done=0, total=input_rows, phase="queued"),
             }
-        )
-    return _json(_run())
+        return _run()
+
+    return _safe("resolve_people" if not estimate_only else "estimate", _go)
 
 
 @mcp.tool(
@@ -209,7 +245,7 @@ def get_profile(client_tag: str) -> str:
     _reload_settings()
     from people_waterfall.profile import get_profile as _get
 
-    return _json(_get(client_tag).to_public())
+    return _safe("get_profile", lambda: _get(client_tag).to_public())
 
 
 @mcp.tool(
@@ -224,7 +260,7 @@ def get_job_status(job_id: str) -> str:
     """Last known progress for a job. Never a bare error."""
     from mcp_server.jobs import get_job
 
-    return _json(get_job(job_id).to_public())
+    return _safe("get_job_status", lambda: get_job(job_id).to_public())
 
 
 @mcp.tool(
@@ -239,7 +275,7 @@ def list_jobs(limit: int = 20) -> str:
     """Recent people-waterfall jobs on this process."""
     from mcp_server.jobs import list_jobs as _list
 
-    return _json([j.to_public() for j in _list(limit=limit)])
+    return _safe("list_jobs", lambda: [j.to_public() for j in _list(limit=limit)])
 
 
 @mcp.tool(
@@ -264,7 +300,45 @@ def regate_name_bank(client_tag: str) -> str:
     _reload_settings()
     from people_waterfall.regate import regate_name_bank as _regate
 
-    return _json(_regate(client_tag))
+    return _safe("regate_name_bank", lambda: _regate(client_tag))
+
+
+@mcp.tool(
+    name="resume_discolike_task",
+    title="Resume DiscoLike task",
+    structured_output=False,
+    annotations=ToolAnnotations(
+        title="Resume DiscoLike task",
+        readOnlyHint=False,
+        openWorldHint=True,
+        destructiveHint=False,
+    ),
+)
+def resume_discolike_task(
+    task_id: str,
+    client_tag: str,
+    source_table: str,
+    where: str = "",
+) -> str:
+    """Re-read a finished DiscoLike task and write gates. Free. No new vendor spend.
+
+    GET /discogen/status/{task_id}, then the same once-per-domain gates and
+    writes as a task that just completed. First use: task
+    c059d0fa-2ed2-42f9-98fe-ce9850bcfa47, client emcor, where pilot_batch = 'dl1k'.
+    """
+    _ensure_repo_cwd()
+    _reload_settings()
+    from people_waterfall.waterfall import resume_discolike_task as _resume
+
+    return _safe(
+        "resume_discolike_task",
+        lambda: _resume(
+            task_id,
+            client_tag,
+            source_table,
+            where,
+        ),
+    )
 
 
 @mcp.tool(
@@ -304,7 +378,7 @@ def receipt_test(
         )
 
     if estimate_only or not background:
-        return _json(_run())
+        return _safe("receipt_test", _run)
     from mcp_server.jobs import start_job, update_job_progress
 
     def worker(job: Any) -> dict[str, Any]:

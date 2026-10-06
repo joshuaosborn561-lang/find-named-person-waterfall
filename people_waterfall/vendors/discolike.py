@@ -114,6 +114,7 @@ class DiscoLikeClient:
         self.tasks = 0
         self.last_error = ""
         self._integration_id = ""
+        self.on_task_started: Any = None
 
     @property
     def api_key(self) -> str:
@@ -225,7 +226,34 @@ class DiscoLikeClient:
         self.calls += len(cleaned)
         self.tasks += 1
         log.info("discolike started task_id=%s domains=%s", task_id, len(cleaned))
+        hook = self.on_task_started
+        if callable(hook):
+            hook(task_id)
         return task_id
+
+    def fetch_task(self, task_id: str) -> dict[str, Any]:
+        """One free GET of a finished task. Does not start a generate."""
+        if not self.enabled:
+            raise RuntimeError("DISCOLIKE_API_KEY is missing")
+        raw_id = (task_id or "").strip()
+        if not raw_id:
+            raise RuntimeError("discolike task_id is required")
+        url = f"{self.base_url}{DISCOGEN_STATUS.format(task_id=raw_id)}"
+        r = http_client.get(self.tier, url, headers=self._headers(), timeout=60)
+        if r is None:
+            raise RuntimeError(f"discolike status failed for {raw_id} (no response)")
+        if r.status_code >= 400:
+            raise RuntimeError(f"discolike status failed for {raw_id} ({r.status_code})")
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise RuntimeError("discolike status returned non-JSON") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("discolike status returned an unexpected payload")
+        status = str(data.get("status") or "").strip().lower()
+        if status not in DONE_OK:
+            raise RuntimeError(f"discolike task {raw_id} is {status or 'unfinished'}")
+        return data
 
     def poll_task(self, task_id: str, *, n_domains: int = 1) -> dict[str, Any]:
         budget = poll_budget_s(n_domains)

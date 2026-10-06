@@ -84,6 +84,8 @@ class ClientProfile:
     client_tag: str
     target_titles: list[str] = field(default_factory=list)
     title_synonyms: dict[str, str] = field(default_factory=dict)
+    title_priority: list[str] = field(default_factory=list)
+    exclude_titles: list[str] = field(default_factory=list)
     title_exclude_regex: str = ""
     seniority_floor: str = ""
     fallback_titles: list[str] = field(default_factory=list)
@@ -107,7 +109,20 @@ class ClientProfile:
 
     @property
     def contacts_table(self) -> str:
-        return f"{self.client_tag}_wf_contacts"
+        """Schema-qualified contacts relation. Already includes the schema."""
+        raw = str(self.raw.get("contacts_table") or "").strip()
+        if not raw:
+            raw = str(self.contacts_table_ref().get("qualified") or "").strip()
+        if not raw:
+            raw = f"{self.client_tag}_wf_contacts"
+        if "." not in raw:
+            return f"public.{raw}"
+        return raw
+
+    @property
+    def contacts_table_name(self) -> str:
+        """Unqualified table name for PostgREST and pw_ensure_contacts_columns."""
+        return self.contacts_table.rsplit(".", 1)[-1]
 
     @property
     def person_geo_mode(self) -> str:
@@ -124,6 +139,8 @@ class ClientProfile:
             "client_tag": self.client_tag,
             "target_titles": list(self.target_titles),
             "title_synonyms": dict(self.title_synonyms),
+            "title_priority": list(self.title_priority),
+            "exclude_titles": list(self.exclude_titles),
             "title_exclude_regex": self.title_exclude_regex,
             "seniority_floor": self.seniority_floor,
             "fallback_titles": list(self.fallback_titles),
@@ -138,7 +155,7 @@ class ClientProfile:
             "people_measured_rates": dict(self.people_measured_rates),
             "discolike_icp_text": self.discolike_icp_text,
             "domain_tier_order": list(self.domain_tier_order),
-            "contacts_table": f"public.{self.contacts_table}",
+            "contacts_table": self.contacts_table,
         }
 
 
@@ -152,6 +169,8 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
         client_tag=client_tag,
         target_titles=_as_list(doc.get("target_titles")),
         title_synonyms=_as_str_map(doc.get("title_synonyms")),
+        title_priority=_as_list(doc.get("title_priority")),
+        exclude_titles=_as_list(doc.get("exclude_titles")),
         title_exclude_regex=str(doc.get("title_exclude_regex") or ""),
         seniority_floor=str(doc.get("seniority_floor") or ""),
         fallback_titles=_as_list(doc.get("fallback_titles")),
@@ -318,6 +337,8 @@ def get_profile(client_tag: str) -> ClientProfile:
     for key in (
         "target_titles",
         "title_synonyms",
+        "title_priority",
+        "exclude_titles",
         "title_exclude_regex",
         "seniority_floor",
         "fallback_titles",

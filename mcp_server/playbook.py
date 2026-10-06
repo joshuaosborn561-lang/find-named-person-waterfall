@@ -20,7 +20,9 @@ Waterfall `ensure_profile` creates the row.
   Zero-pass companies are written wf_people_status=people_unresolved.
   counter.done counts companies that finished every selected tier.
   Contacts, name_bank, and wf_people_status are written after each tier
-  batch. A write error fails the job before the next tier spends.
+  batch, in that order, in chunks of 500 with three retries. Contacts
+  upsert on (client_tag, domain, lower first name, lower last name).
+  A write error fails the job before the next tier spends.
   A job that spent money and wrote 0 contacts fails instead of completing.
 - `receipt_test(client_tag, n)` — phase-zero ground-truth score. Prints live
   prices, drops zero-yield people tiers, writes `people_tier_order`. Never
@@ -33,9 +35,24 @@ Waterfall `ensure_profile` creates the row.
 
 ## Ordering
 
-Default people_tier_order is cache → discolike → leadmagic_employee.
-Those are the only people tiers. A receipt may drop a zero-yield
-default tier; it does not cheapest-sort the declared order.
+Default people_tier_order is site_staff → cache → discolike →
+leadmagic_employee. site_staff is free and runs first. Paid unit
+prices and the cache → discolike → leadmagic_employee order do not
+change. A receipt may drop a zero-yield default tier; it does not
+cheapest-sort the declared order.
+
+site_staff reads public.site_pages, then fetches up to 8 same-domain
+staff/team/about/contact pages. It writes one contact per domain
+(source site_staff, email_type personal|role|generic) or banks a
+title match with no email. max_tier=site_staff runs only that tier.
+
+Before any paid call the job checks the profile, source table,
+contacts table, and wf_people_* columns. Missing writeback columns
+are added, or status goes to public.wf_people_status. Contacts and
+name_bank flush every 50 companies. After 100 companies, spend above
+$0 with 0 contacts pauses the job (reason spending_without_output).
+A vendor row with only a first name is banked with last_name '' and
+rejection_reason single_name. Tool errors return {ok:false, error, stage}.
 
 DiscoLike is the primary discovery tier. It needs a domain. One sequential
 task for the full domain list (cap 5,000; more domains run as later
@@ -43,7 +60,12 @@ tasks, never concurrent). search_context_size=low (2 queries),
 max_contacts_per_domain=3, find_emails=false. integration_id is
 "native" (Groove, no LLM key). search_provider_id is the account's
 Serper provider from GET /v1/search-providers.
-A selected paid tier that makes zero calls fails the job.
+  A selected paid tier that makes zero calls fails the job.
+  The generate task_id is stored on the job the moment start_generate
+  returns, before polling. resume_discolike_task(task_id, client_tag,
+  source_table, where) re-reads GET /discogen/status/{task_id} for free
+  and runs the same gates and writes. Duplicate source domains are gated
+  once; sibling rows are writeback copies and are not banked again.
 icp_text comes from profile.discolike_icp_text (generated from
 target_titles + vertical on first run). Cost is
 SERPER_USD_PER_QUERY × 2 + DISCOLIKE_USD_PER_COMPANY (defaults

@@ -1,7 +1,9 @@
 """Live unit prices for the people-tier list.
 
-Default order is cache → discolike → leadmagic_employee. A receipt may
-drop a zero-yield tier; it never reorders the declared sequence.
+Default order is site_staff → cache → discolike → leadmagic_employee.
+site_staff is free. Paid unit prices and the cache → discolike →
+leadmagic_employee order do not change. A receipt may drop a zero-yield
+tier; it never reorders the declared sequence.
 """
 
 from __future__ import annotations
@@ -12,7 +14,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # Published 2026-09-09 midpoints used only until the live account rate is read.
+# site_staff is free and always first. Paid unit prices are unchanged.
 PUBLISHED: dict[str, dict[str, Any]] = {
+    "site_staff": {
+        "needs": "domain",
+        "billing": "free",
+        "credits": 0.0,
+        "unit_usd": 0.0,
+        "receipt_lanes": ("domain",),
+    },
     "cache": {
         "needs": "either",
         "billing": "free",
@@ -45,9 +55,13 @@ TIER_ALIASES = {
     "lm": "leadmagic_employee",
     "disco": "discolike",
     "discogen": "discolike",
+    "site": "site_staff",
+    "website": "site_staff",
+    "staff": "site_staff",
 }
 
 DEFAULT_ORDER = [
+    "site_staff",
     "cache",
     "discolike",
     "leadmagic_employee",
@@ -130,6 +144,13 @@ def compute_tier_order(
             continue
         seen.add(name)
         names.append(name)
+    # site_staff is free and runs before cache / getleads / any paid tier.
+    # An explicit people_tier_order that omits it still gets it first,
+    # unless a receipt dropped it. Paid order after that is unchanged.
+    if "site_staff" in dropped and "site_staff" in names:
+        names = [name for name in names if name != "site_staff"]
+    elif "site_staff" not in dropped:
+        names = ["site_staff", *[name for name in names if name != "site_staff"]]
     # Default (and explicit people_tier_order) keep declared sequence.
     # Receipt may drop a zero-yield tier; it does not cheapest-sort this list.
 
