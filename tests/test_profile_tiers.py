@@ -41,4 +41,6 @@ def test_domain_string_order_is_not_treated_as_people_order():
         "peterson_roof",
         {"people_tier_order": ["maps", {"tier": "discolike"}, {"tier": "unknown"}]},
     )
-    assert [row["tier"] for row in profile.people_tier_order] == ["discolike"]
+    # Object rows are kept so include_from_profile can warn on unknown names.
+    # String leftovers from a domain order are still ignored.
+    assert [row["tier"] for row in profile.people_tier_order] == ["discolike", "unknown"]

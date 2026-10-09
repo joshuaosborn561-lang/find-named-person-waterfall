@@ -36,10 +36,12 @@ Waterfall `ensure_profile` creates the row.
 ## Ordering
 
 Default people_tier_order is site_staff → cache → discolike →
-leadmagic_employee. site_staff is free and runs first. Paid unit
-prices and the cache → discolike → leadmagic_employee order do not
-change. A receipt may drop a zero-yield default tier; it does not
-cheapest-sort the declared order.
+prospeo_search → aiark_people. site_staff is free and runs first.
+A receipt may drop a zero-yield default tier; it does not
+cheapest-sort the declared order. Legacy leadmagic_employee /
+leadmagic_role names in a profile or request are no-ops with a
+warning (deprecated_tiers). Unrecognized names in a custom order
+are listed on unrecognized_tiers — they are not silently dropped.
 
 site_staff reads public.site_pages, then fetches up to 8 same-site
 staff/team/about/contact pages (registrable domain match; www and

@@ -167,7 +167,7 @@ def test_discolike_fixture_writes_once_per_domain(monkeypatch):
         min_tier="discolike",
         max_tier="discolike",
         write_supabase=True,
-        vendors=VendorBundle(cache=_Empty(), leadmagic=_Empty(), discolike=disco),
+        vendors=VendorBundle(cache=_Empty(), discolike=disco),
     )
 
     assert result["counts"]["written"] > 0

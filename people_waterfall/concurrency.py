@@ -12,15 +12,15 @@ from typing import Iterator
 import requests
 
 TIER_ENV_KEYS: dict[str, str] = {
-    "leadmagic": "LEADMAGIC_CONCURRENCY",
-    "leadmagic_employee": "LEADMAGIC_CONCURRENCY",
     "discolike": "DISCOLIKE_CONCURRENCY",
+    "prospeo_search": "PROSPEO_CONCURRENCY",
+    "aiark_people": "AI_ARK_CONCURRENCY",
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
-    "leadmagic": 6,
-    "leadmagic_employee": 6,
     "discolike": 1,
+    "prospeo_search": 2,
+    "aiark_people": 6,
 }
 
 DEFAULT_COMPANY_CONCURRENCY = 20

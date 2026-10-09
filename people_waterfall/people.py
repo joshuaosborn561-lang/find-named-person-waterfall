@@ -243,6 +243,7 @@ class PersonHit:
     rejection_reason: str = ""
     name_bank_status: str = ""
     title_rank: int | None = None
+    aiark_person_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

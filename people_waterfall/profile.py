@@ -191,10 +191,13 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
 def _people_tier_order(doc: dict[str, Any]) -> list[dict[str, Any]]:
     own = doc.get("people_tier_order")
     if isinstance(own, list) and own:
+        # Keep every object row, including legacy / unknown names, so
+        # include_from_profile can warn instead of dropping them silently.
+        # String names are domain-order leftovers and are still ignored.
         return [
             row
             for row in own
-            if isinstance(row, dict) and str(row.get("tier") or "") in PUBLISHED
+            if isinstance(row, dict) and str(row.get("tier") or "").strip()
         ]
     # Never use domain tier_order (maps / discolike / string names).
     return []
@@ -208,7 +211,7 @@ def _people_dropped_tiers(doc: dict[str, Any]) -> list[str]:
             if t in PUBLISHED
         ]
     # Domain receipts drop cache/aiark/leadmagic for domain search.
-    # Those names are people-finder tiers here — do not inherit them.
+    # Those names are not people-finder tiers here — do not inherit them.
     return []
 
 

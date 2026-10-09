@@ -30,6 +30,7 @@ def test_handoff_calls_ensure_client_first(monkeypatch):
     assert calls[0][1]["client_tag"] == "goliath"
     assert calls[1][1]["source_table"] == "public.goliath_wf_contacts"
     assert calls[1][1]["client_tag"] == "goliath"
+    assert calls[1][1]["max_tier"] == "aiark"
     assert result["queued"] is True
     assert result["ensured"] is True
 

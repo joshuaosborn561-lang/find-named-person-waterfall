@@ -77,11 +77,34 @@ class _Disco:
         return list(row.people) if row else []
 
 
+class _NoopPaid:
+    enabled = True
+    calls = 0
+    last_credits_used = 0.0
+    last_error = ""
+    seen: list[str]
+
+    def __init__(self):
+        self.seen = []
+        self.calls = 0
+
+    def find_people(self, **kwargs):
+        self.seen.append(kwargs.get("domain") or "")
+        self.calls += 1
+        return []
+
+    def search_people(self, domains, **kwargs):
+        self.seen.extend(list(domains))
+        self.calls += max(1, len(domains))
+        return {d: [] for d in domains}
+
+
 def _bundle(disco=None) -> VendorBundle:
     return VendorBundle(
         cache=_Empty(),
-        leadmagic=_Empty(),
         discolike=disco or _Disco(),
+        prospeo=_NoopPaid(),
+        aiark=_NoopPaid(),
     )
 
 
@@ -222,25 +245,17 @@ def test_estimate_only_emcor_unresolved_selects_and_prices_discolike(monkeypatch
     assert result["estimate_only"] is True
     assert result["source_table"] == "public.emcor_companies"
     assert "discolike" in result["selected_tiers"]
-    assert result["selected_tiers"] == ["site_staff", "cache", "discolike", "leadmagic_employee"]
+    assert result["selected_tiers"] == [
+        "site_staff",
+        "cache",
+        "discolike",
+        "prospeo_search",
+        "aiark_people",
+    ]
     disco = next(t for t in result["tiers"] if t["tier"] == "discolike")
     assert disco["rows"] == 2
     assert disco["estimated_usd"] == pytest.approx(0.0055 * 2)
     assert disco["unit_usd"] == pytest.approx(0.0055)
-
-
-class _Lead:
-    enabled = True
-
-    def __init__(self):
-        self.seen: list[str] = []
-
-    def employee_finder(self, **kwargs):
-        self.seen.append(kwargs.get("domain") or "")
-        return []
-
-    def find_people(self, **kwargs):
-        return []
 
 
 class _OffDisco:
@@ -251,16 +266,26 @@ class _OffDisco:
         raise AssertionError("discolike must not be called without an API key")
 
 
-def test_missing_key_fails_before_leadmagic(monkeypatch):
-    lead = _Lead()
+def test_missing_key_fails_before_later_paid_tiers(monkeypatch):
+    later = _NoopPaid()
     rows = [{"domain": "acme.com", "company_name": "Acme", "_source_key": "1"}]
     with pytest.raises(RuntimeError, match="DISCOLIKE_API_KEY"):
-        _run(monkeypatch, rows, VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_OffDisco()))
-    assert lead.seen == []
+        _run(
+            monkeypatch,
+            rows,
+            VendorBundle(
+                cache=_Empty(),
+                discolike=_OffDisco(),
+                prospeo=later,
+                aiark=later,
+            ),
+        )
+    assert later.seen == []
 
 
-def test_leadmagic_runs_only_without_title_match(monkeypatch):
-    lead = _Lead()
+def test_later_paid_tiers_run_only_without_title_match(monkeypatch):
+    prospeo = _NoopPaid()
+    aiark = _NoopPaid()
     rows = [
         {"domain": "acme.com", "company_name": "Acme", "_source_key": "1"},
         {"domain": "beta.com", "company_name": "Beta", "_source_key": "2"},
@@ -275,11 +300,14 @@ def test_leadmagic_runs_only_without_title_match(monkeypatch):
     result = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_Disco()),
+        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=prospeo, aiark=aiark),
         progress_callback=_progress,
     )
-    assert lead.seen == ["beta.com"]
-    assert result["per_tier"]["leadmagic_employee"]["calls"] == 1
+    assert "acme.com" not in prospeo.seen
+    assert "beta.com" in prospeo.seen
+    assert aiark.seen == ["beta.com"]
+    assert result["per_tier"]["prospeo_search"]["calls"] == 1
+    assert result["per_tier"]["aiark_people"]["calls"] == 1
     assert result["per_tier"]["discolike"]["calls"] == 2
     assert result["counter"]["done"] == 2
     assert result["counts"]["companies"] == 2
@@ -291,7 +319,8 @@ def test_leadmagic_runs_only_without_title_match(monkeypatch):
 def test_write_failure_stops_before_next_tier(monkeypatch):
     from people_waterfall import waterfall as wf
 
-    lead = _Lead()
+    prospeo = _NoopPaid()
+    aiark = _NoopPaid()
     rows = [{"domain": "acme.com", "company_name": "Acme", "_source_key": "1"}]
 
     def _boom(profile, accepted):
@@ -301,11 +330,12 @@ def test_write_failure_stops_before_next_tier(monkeypatch):
         _run(
             monkeypatch,
             rows,
-            VendorBundle(cache=_Empty(), leadmagic=lead, discolike=_Disco()),
+            VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=prospeo, aiark=aiark),
             write_supabase=True,
             write_contacts_fn=_boom,
         )
-    assert lead.seen == []
+    assert prospeo.seen == []
+    assert aiark.seen == []
 
 
 def test_generate_uses_serper_integration(monkeypatch):
