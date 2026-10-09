@@ -89,6 +89,8 @@ def contact_payload(
         "confidence": source_confidence,
         "source_tool": "people-waterfall",
     }
+    if person.aiark_person_id:
+        row["aiark_person_id"] = person.aiark_person_id
     for key in FORBIDDEN:
         row.pop(key, None)
     if any(k.startswith("skip_") for k in row):

@@ -265,9 +265,15 @@ def run_receipt(
     name_sample = pick_name_sample(profile, n)
 
     def estimate() -> dict[str, Any]:
-        lm_unit = rates.unit_usd("leadmagic_employee")
         disco_unit = rates.unit_usd("discolike")
-        est = lm_unit * n * 8 + disco_unit * len(domain_sample)
+        prospeo_unit = rates.unit_usd("prospeo_search")
+        aiark_unit = rates.unit_usd("aiark_people")
+        # Worst case: disco every domain + 1 Prospeo page/domain + 3 AI Ark results.
+        est = (
+            disco_unit * len(domain_sample)
+            + prospeo_unit * len(domain_sample)
+            + aiark_unit * len(domain_sample) * 3
+        )
         return {
             "ok": True,
             "estimate_only": True,
@@ -277,9 +283,11 @@ def run_receipt(
             "name_companies": len(name_sample),
             "estimated_usd": round(est, 4),
             "live_rates": {
-                "leadmagic_per_credit": rates.leadmagic_per_credit,
-                "leadmagic_credits": rates.leadmagic_credits,
-                "leadmagic_plan": rates.leadmagic_plan,
+                "aiark_per_credit": rates.aiark_per_credit,
+                "aiark_credits": rates.aiark_credits,
+                "prospeo_per_credit": rates.prospeo_per_credit,
+                "prospeo_credits": rates.prospeo_credits,
+                "prospeo_plan": rates.prospeo_plan,
                 "notes": rates.notes,
             },
             "tier_order": order,
@@ -370,7 +378,7 @@ def run_receipt(
                 unit = float(meta.get("unit_usd") or 0)
                 billing = meta.get("billing") or "always"
                 cost = 0.0
-                if billing == "always":
+                if billing in {"always", "per_result"}:
                     cost = unit * len(people)
                 elif billing == "free_on_miss" and tally["people"]:
                     cost = unit * max(tally["people"], 1)

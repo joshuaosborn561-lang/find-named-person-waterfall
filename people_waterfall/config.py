@@ -15,8 +15,9 @@ DEFAULT_SUPABASE_URL = "https://azpapwtnrbzywlnxxecz.supabase.co"
 DEFAULT_SUPABASE_PROJECT = "azpapwtnrbzywlnxxecz"
 
 API_KEY_ALIASES: dict[str, tuple[str, ...]] = {
-    "leadmagic": ("leadmagic", "leadmagic_api_key", "LEADMAGIC_API_KEY", "LEADMAGIC_KEY"),
     "discolike": ("discolike", "discolike_api_key", "DISCOLIKE_API_KEY", "DISCO_API_KEY"),
+    "ai_ark": ("ai_ark", "aiark", "ai_ark_api_key", "AI_ARK_API_KEY", "AIARK_API_KEY"),
+    "prospeo": ("prospeo", "prospeo_api_key", "PROSPEO_API_KEY"),
 }
 
 
@@ -29,8 +30,9 @@ class Settings:
     supabase_url: str
     supabase_service_role_key: str
     supabase_anon_key: str
-    leadmagic_api_key: str
     discolike_api_key: str
+    ai_ark_api_key: str
+    prospeo_api_key: str
     email_waterfall_url: str
 
     @property
@@ -47,8 +49,9 @@ def load_settings() -> Settings:
         supabase_url=_env("SUPABASE_URL", DEFAULT_SUPABASE_URL).rstrip("/"),
         supabase_service_role_key=_env("SUPABASE_SERVICE_ROLE_KEY"),
         supabase_anon_key=_env("SUPABASE_ANON_KEY"),
-        leadmagic_api_key=_env("LEADMAGIC_API_KEY") or _env("LEADMAGIC_KEY"),
         discolike_api_key=_env("DISCOLIKE_API_KEY") or _env("DISCO_API_KEY"),
+        ai_ark_api_key=_env("AI_ARK_API_KEY") or _env("AIARK_API_KEY"),
+        prospeo_api_key=_env("PROSPEO_API_KEY"),
         email_waterfall_url=_env("EMAIL_WATERFALL_URL").rstrip("/"),
     )
 
@@ -79,7 +82,8 @@ def merge_private_keys(rows: list[dict[str, str]]) -> Settings:
 
     updated = replace(
         settings,
-        leadmagic_api_key=pick(settings.leadmagic_api_key, *API_KEY_ALIASES["leadmagic"]),
         discolike_api_key=pick(settings.discolike_api_key, *API_KEY_ALIASES["discolike"]),
+        ai_ark_api_key=pick(settings.ai_ark_api_key, *API_KEY_ALIASES["ai_ark"]),
+        prospeo_api_key=pick(settings.prospeo_api_key, *API_KEY_ALIASES["prospeo"]),
     )
     return updated

@@ -75,8 +75,10 @@ def _reload_settings() -> None:
     # so a key loaded from private.api_keys is visible to os.environ checks.
     if cfg.settings.discolike_api_key and not os.environ.get("DISCOLIKE_API_KEY"):
         os.environ["DISCOLIKE_API_KEY"] = cfg.settings.discolike_api_key
-    if cfg.settings.leadmagic_api_key and not os.environ.get("LEADMAGIC_API_KEY"):
-        os.environ["LEADMAGIC_API_KEY"] = cfg.settings.leadmagic_api_key
+    if cfg.settings.ai_ark_api_key and not os.environ.get("AI_ARK_API_KEY"):
+        os.environ["AI_ARK_API_KEY"] = cfg.settings.ai_ark_api_key
+    if cfg.settings.prospeo_api_key and not os.environ.get("PROSPEO_API_KEY"):
+        os.environ["PROSPEO_API_KEY"] = cfg.settings.prospeo_api_key
 
 
 TOOL_NAMES = [
@@ -149,8 +151,9 @@ def resolve_people(
     live unit prices with no spend. Set estimate_only=false to start a job.
     approve_cost_usd < 0 means no paid ceiling. Free tiers ignore the ceiling.
     min_tier / max_tier are an inclusive window on the people-tier order.
-    skip_tiers is a comma list (e.g. leadmagic_employee). DiscoLike-only:
-    min_tier=discolike max_tier=discolike. Response is counts / job_id / cost only.
+    skip_tiers is a comma list (e.g. discolike). Legacy leadmagic_* names
+    are no-ops. DiscoLike-only: min_tier=discolike max_tier=discolike.
+    Response is counts / job_id / cost only.
     """
     _ensure_repo_cwd()
     _reload_settings()

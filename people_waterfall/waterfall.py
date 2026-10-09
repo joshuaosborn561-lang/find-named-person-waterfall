@@ -11,9 +11,12 @@ from .people import PersonHit, conversational_company, looks_like_person
 from .pricing import (
     PUBLISHED,
     LiveRates,
+    classify_request_tiers,
     compute_tier_order,
+    estimate_credits,
     include_from_profile,
     parse_tier_list,
+    plan_profile_tiers,
     select_tiers,
 )
 from .profile import (
@@ -38,13 +41,14 @@ from .preflight import preflight_job
 from .site_quality import (
     bankable_person,
     name_is_valid,
+    registrable_domain,
     should_pause_for_site_staff_quality,
 )
+from .vendors.aiark import AiArkPeopleClient, TitlesRequired
 from .vendors.cache import CacheClient
 from .vendors.discolike import DiscoLikeClient
-from .vendors.leadmagic import LeadMagicClient
+from .vendors.prospeo import ProspeoSearchClient
 from .vendors.site_staff import SiteStaffClient
-from .vendors.leadmagic import per_credit_from_payload as lm_per_credit
 from .write import (
     call_with_retry,
     contact_payload,
@@ -73,48 +77,74 @@ def should_pause_for_spend(companies_done: int, spent_usd: float, contacts_writt
 @dataclass
 class VendorBundle:
     cache: CacheClient
-    leadmagic: LeadMagicClient
     discolike: DiscoLikeClient
     site_staff: SiteStaffClient | None = None
+    prospeo: ProspeoSearchClient | None = None
+    aiark: AiArkPeopleClient | None = None
 
     def __post_init__(self) -> None:
         if self.site_staff is None:
             self.site_staff = SiteStaffClient(enabled=False)
+        if self.prospeo is None:
+            self.prospeo = ProspeoSearchClient(api_key="")
+        if self.aiark is None:
+            self.aiark = AiArkPeopleClient(api_key="")
 
     def for_tier(self, tier: str) -> Any:
         return {
             "cache": self.cache,
-            "leadmagic_employee": self.leadmagic,
             "discolike": self.discolike,
             "site_staff": self.site_staff,
+            "prospeo_search": self.prospeo,
+            "aiark_people": self.aiark,
         }.get(tier)
 
 
 def build_vendors() -> VendorBundle:
     return VendorBundle(
         cache=CacheClient(),
-        leadmagic=LeadMagicClient(),
         discolike=DiscoLikeClient(),
         site_staff=SiteStaffClient(),
+        prospeo=ProspeoSearchClient(),
+        aiark=AiArkPeopleClient(),
     )
+
+
+def _balance(payload: dict[str, Any]) -> float | None:
+    for key in ("credits", "remaining", "balance", "credit"):
+        val = payload.get(key)
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, dict):
+            inner = val.get("remaining") or val.get("credits") or val.get("balance")
+            if isinstance(inner, (int, float)):
+                return float(inner)
+    return None
 
 
 def read_live_rates(vendors: VendorBundle) -> LiveRates:
     rates = LiveRates()
-    if vendors.leadmagic.enabled:
-        payload = vendors.leadmagic.credits()
-        rates.leadmagic_credits = None
-        per, plan = lm_per_credit(payload)
-        rates.leadmagic_per_credit = per
-        rates.leadmagic_plan = plan
-        bal = payload.get("credits") or payload.get("remaining") or payload.get("balance")
-        if isinstance(bal, (int, float)):
-            rates.leadmagic_credits = float(bal)
-        elif isinstance(bal, dict) and isinstance(bal.get("remaining"), (int, float)):
-            rates.leadmagic_credits = float(bal["remaining"])
-        if rates.leadmagic_per_credit is None:
-            rates.leadmagic_per_credit = 0.0198
-            rates.notes.append("leadmagic per-credit defaulted to Essential midpoint")
+    if vendors.aiark is not None and vendors.aiark.enabled:
+        payload = vendors.aiark.credits()
+        rates.aiark_credits = _balance(payload)
+        per = payload.get("credit_price") or payload.get("usd_per_credit")
+        if isinstance(per, (int, float)) and per > 0:
+            rates.aiark_per_credit = float(per)
+        if rates.aiark_per_credit is None:
+            rates.aiark_per_credit = 0.003667
+            rates.notes.append("aiark per-credit defaulted to $220/60k")
+    if vendors.prospeo is not None and vendors.prospeo.enabled:
+        payload = vendors.prospeo.account_information()
+        rates.prospeo_credits = _balance(payload)
+        rates.prospeo_plan = str(
+            payload.get("plan") or payload.get("plan_name") or payload.get("tier") or ""
+        )
+        per = payload.get("credit_price") or payload.get("usd_per_credit")
+        if isinstance(per, (int, float)) and per > 0:
+            rates.prospeo_per_credit = float(per)
+        if rates.prospeo_per_credit is None:
+            rates.prospeo_per_credit = 0.0148
+            rates.notes.append("prospeo per-credit defaulted to Growth yearly $0.0148")
     return rates
 
 
@@ -142,8 +172,10 @@ def _call_tier(
         "state": state,
         "titles": titles,
     }
-    if tier == "leadmagic_employee":
-        return vendors.leadmagic.employee_finder(**kwargs)
+    if tier == "aiark_people":
+        return vendors.aiark.find_people(**kwargs) if vendors.aiark is not None else []
+    if tier == "prospeo_search":
+        return vendors.prospeo.find_people(**kwargs) if vendors.prospeo is not None else []
     return client.find_people(**kwargs)
 
 
@@ -313,6 +345,15 @@ def estimate_job(
         elif row["tier"] == "discolike":
             priced_rows = count_source_with_domain(src)
             cost = unit * priced_rows
+        elif name in {"prospeo_search", "aiark_people"}:
+            priced_rows = count_source_with_domain(src)
+            if name == "prospeo_search":
+                # Worst case 1 credit per domain (cover loop). Typical is
+                # ceil(n/25)+2; the ceiling uses the worst case.
+                cost = unit * estimate_credits(name, priced_rows)
+            else:
+                # Worst case 3 results × 0.5 cr per remaining domain.
+                cost = unit * priced_rows * 3
         else:
             cost = unit * rows
         total += cost
@@ -336,9 +377,11 @@ def estimate_job(
         "tiers": per_tier,
         "estimated_usd": round(total, 4),
         "live_rates": {
-            "leadmagic_per_credit": rates.leadmagic_per_credit,
-            "leadmagic_credits": rates.leadmagic_credits,
-            "leadmagic_plan": rates.leadmagic_plan,
+            "aiark_per_credit": rates.aiark_per_credit,
+            "aiark_credits": rates.aiark_credits,
+            "prospeo_per_credit": rates.prospeo_per_credit,
+            "prospeo_credits": rates.prospeo_credits,
+            "prospeo_plan": rates.prospeo_plan,
             "notes": rates.notes,
         },
         "tier_order": order,
@@ -380,11 +423,20 @@ def resolve_people(
     if on_discolike_task is not None:
         bundle.discolike.on_task_started = on_discolike_task
     rates = read_live_rates(bundle)
+    planned = plan_profile_tiers(profile.people_tier_order)
+    request_notes = classify_request_tiers(
+        min_tier=min_tier, max_tier=max_tier, skip_tiers=skip_tiers
+    )
+    deprecated_tiers = list(dict.fromkeys([*planned.deprecated, *request_notes.deprecated]))
+    unrecognized_tiers = list(
+        dict.fromkeys([*planned.unrecognized, *request_notes.unrecognized])
+    )
+    tier_notes = list(dict.fromkeys([*planned.notes, *request_notes.notes, *rates.notes]))
     order = compute_tier_order(
         rates=rates,
         measured_rates=profile.people_measured_rates,
         dropped_tiers=profile.people_dropped_tiers,
-        include=include_from_profile(profile.people_tier_order),
+        include=planned.include if planned.include is not None else include_from_profile(profile.people_tier_order),
     )
     allowed = select_tiers(
         order,
@@ -394,12 +446,39 @@ def resolve_people(
     )
     skipped = parse_tier_list(skip_tiers)
 
+    if "aiark_people" in allowed and not list(profile.target_titles):
+        raise TitlesRequired(
+            "aiark_people is selected but the profile has no target_titles; "
+            "refusing to search without a title filter"
+        )
+
     if estimate_only:
         quote = estimate_job(src, profile=profile, rates=rates, order=order, tiers=allowed)
         quote["min_tier"] = min_tier or ""
         quote["max_tier"] = max_tier
         quote["skip_tiers"] = skipped
+        quote["deprecated_tiers"] = deprecated_tiers
+        quote["unrecognized_tiers"] = unrecognized_tiers
+        quote["warnings"] = tier_notes
+        if approve_cost_usd is not None and quote["estimated_usd"] > approve_cost_usd:
+            quote["status"] = "deferred"
+            quote["reason"] = "estimated_usd exceeds approve_cost_usd"
+            quote["approve_cost_usd"] = approve_cost_usd
         return quote
+
+    if approve_cost_usd is not None:
+        quote = estimate_job(src, profile=profile, rates=rates, order=order, tiers=allowed)
+        if quote["estimated_usd"] > approve_cost_usd:
+            return {
+                **quote,
+                "estimate_only": False,
+                "status": "deferred",
+                "reason": "estimated_usd exceeds approve_cost_usd",
+                "approve_cost_usd": approve_cost_usd,
+                "deprecated_tiers": deprecated_tiers,
+                "unrecognized_tiers": unrecognized_tiers,
+                "warnings": tier_notes,
+            }
 
     if write_supabase:
         ensure_people_writeback(src)
@@ -480,8 +559,10 @@ def resolve_people(
         nonlocal spent
         if cost_override is not None:
             cost = cost_override
+        elif billing == "per_result":
+            cost = unit * max(len(people), 0)
         elif billing == "always":
-            if tier == "leadmagic_employee":
+            if tier == "aiark_people":
                 cost = unit * max(len(people), 0)
             else:
                 cost = unit * max(len(people), 1 if people else 0)
@@ -657,7 +738,7 @@ def resolve_people(
 
     def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
         for tier in tiers:
-            if tier in {"discolike", "site_staff"}:
+            if tier in {"discolike", "site_staff", "prospeo_search"}:
                 continue
             if work.accepted_rows:
                 return
@@ -672,7 +753,8 @@ def resolve_people(
                     raise RuntimeError(
                         f"{tier} is selected but is not enabled; refusing to fall through"
                     )
-            if _would_defer(tier, unit, billing):
+            defer_n = 3 if tier == "aiark_people" else 1
+            if _would_defer(tier, unit, billing, n=defer_n):
                 work.deferred = True
                 return
             people = _unique_people(
@@ -694,7 +776,13 @@ def resolve_people(
             work.seen_people.extend(people)
             stats["per_tier"][tier]["calls"] += 1
             stats["per_tier"][tier]["people"] += len(people)
-            _bill(tier, people, unit=unit, billing=billing)
+            extra = None
+            if tier == "aiark_people" and bundle.aiark is not None:
+                charged = getattr(bundle.aiark, "last_credits_used", None)
+                if charged is not None:
+                    per = rates.aiark_per_credit if rates.aiark_per_credit is not None else 0.003667
+                    extra = float(charged) * per
+            _bill(tier, people, unit=unit, billing=billing, cost_override=extra)
             _apply_people(work, tier, people, titles=titles, fallback=fallback)
             # Persist this company before the next paid call.
             _flush([work], finished=False)
@@ -788,6 +876,83 @@ def resolve_people(
                 sibling.tiers_called.add("discolike")
                 sibling.last_source = "discolike"
         # Write the whole DiscoLike batch before any later tier spends.
+        _flush(queued, finished=False)
+
+    def run_prospeo_batch(works: list[_CompanyWork]) -> None:
+        if not works:
+            return
+        meta = _meta_for(order, "prospeo_search", rates)
+        unit = float(meta.get("unit_usd") or 0)
+        billing = meta.get("billing") or "always"
+        queued: list[_CompanyWork] = []
+        for work in works:
+            if work.accepted_rows:
+                continue
+            if not work.domain:
+                work.reason = work.reason or "no_domain"
+                continue
+            if "prospeo_search" in work.tiers_called:
+                continue
+            if _would_defer("prospeo_search", unit, billing):
+                work.deferred = True
+                for rest in works[works.index(work) + 1 :]:
+                    if not rest.accepted_rows:
+                        rest.deferred = True
+                break
+            queued.append(work)
+        if not queued:
+            return
+        if bundle.prospeo is None or not bundle.prospeo.enabled:
+            raise RuntimeError(
+                "prospeo_search is selected but PROSPEO_API_KEY is missing; "
+                "refusing to fall through"
+            )
+        emit("prospeo_search")
+        calls_before = int(getattr(bundle.prospeo, "calls", 0) or 0)
+        companies = {work.domain: work.company for work in queued if work.domain}
+        packed = bundle.prospeo.search_people(
+            [work.domain for work in queued],
+            profile=profile,
+            titles=target_titles,
+            companies=companies,
+        )
+        calls_made = int(getattr(bundle.prospeo, "calls", 0) or 0) - calls_before
+        if calls_made <= 0:
+            raise RuntimeError(
+                getattr(bundle.prospeo, "last_error", "")
+                or "prospeo_search was selected but made 0 calls; refusing to fall through"
+            )
+        credits = float(getattr(bundle.prospeo, "last_credits_used", 0) or 0)
+        batch_cost = credits * unit
+        by_domain: dict[str, list[_CompanyWork]] = {}
+        for work in queued:
+            by_domain.setdefault(work.domain, []).append(work)
+        billed = False
+        for domain, group in by_domain.items():
+            people = _unique_people(
+                list(packed.get(domain) or packed.get(registrable_domain(domain)) or [])
+            )
+            _tier_stat("prospeo_search")["calls"] += 1
+            _tier_stat("prospeo_search")["people"] += len(people)
+            cost = 0.0 if billed else batch_cost
+            billed = True
+            _bill("prospeo_search", people, unit=unit, billing=billing, cost_override=cost)
+            primary = group[0]
+            primary.tiers_called.add("prospeo_search")
+            primary.last_source = "prospeo_search"
+            primary.seen_people.extend(people)
+            _apply_people(
+                primary,
+                "prospeo_search",
+                people,
+                titles=target_titles,
+                fallback=False,
+                source="prospeo_search",
+            )
+            for sibling in group[1:]:
+                adopt_sibling(primary, sibling)
+                sibling.tiers_called.add("prospeo_search")
+                sibling.last_source = "prospeo_search"
         _flush(queued, finished=False)
 
     inflight: dict[str, _CompanyWork] = {}
@@ -938,10 +1103,30 @@ def resolve_people(
             finalize(work)
 
     pending_disco: list[_CompanyWork] = []
+    pending_prospeo: list[_CompanyWork] = []
     pending_after: list[_CompanyWork] = []
     site_buf: list[_CompanyWork] = []
     target_titles = list(profile.target_titles)
     fallback_titles = list(profile.fallback_titles)
+
+    def _queue_after_disco(work: _CompanyWork) -> bool:
+        """Route to prospeo batch, later per-company tiers, or finalize.
+
+        Returns True when the work was queued or finished here.
+        """
+        if work.accepted_rows or work.deferred:
+            finalize(work)
+            return True
+        if "prospeo_search" in work.after or "prospeo_search" in work.lane_order:
+            work.after = [tier for tier in work.after if tier != "prospeo_search"]
+            if work.domain:
+                pending_prospeo.append(work)
+                return True
+            work.reason = work.reason or "no_domain"
+        if work.after:
+            pending_after.append(work)
+            return True
+        return False
 
     def intake_paid(work: _CompanyWork) -> None:
         if work.people_found or work.finished:
@@ -955,15 +1140,13 @@ def resolve_people(
         if has_disco_for(work):
             if not work.domain:
                 work.reason = "no_domain"
-                if work.after and not work.accepted_rows:
-                    pending_after.append(work)
+                if _queue_after_disco(work):
                     return
                 finalize(work)
                 return
             pending_disco.append(work)
             return
-        if work.after and not work.accepted_rows:
-            pending_after.append(work)
+        if _queue_after_disco(work):
             return
         if fallback_titles and work.seen_people and not work.accepted_rows:
             work.used_fallback = True
@@ -1085,8 +1268,7 @@ def resolve_people(
                     if deferred:
                         break
                     continue
-                if work.after:
-                    pending_after.append(work)
+                if _queue_after_disco(work):
                     handed_off.add(id(work))
                     continue
                 if fallback_titles and work.seen_people:
@@ -1117,6 +1299,61 @@ def resolve_people(
             )
     elif pending_disco:
         finalize_rest(pending_disco, as_deferred=True)
+
+    if pending_prospeo and not deferred:
+        emit("prospeo_search")
+        meta = _meta_for(order, "prospeo_search", rates)
+        unit = float(meta.get("unit_usd") or 0)
+        billing = meta.get("billing") or "always"
+        index = 0
+        while index < len(pending_prospeo) and not deferred:
+            slice_works = pending_prospeo[index : index + FLUSH_EVERY]
+            billable = [
+                work
+                for work in slice_works
+                if work.domain
+                and not work.accepted_rows
+                and "prospeo_search" not in work.tiers_called
+            ]
+            if billable and _would_defer("prospeo_search", unit, billing, n=len(billable)):
+                finalize_rest(pending_prospeo[index:], as_deferred=True)
+                break
+            run_prospeo_batch(slice_works)
+            for work in slice_works:
+                if work.finished:
+                    continue
+                if work.accepted_rows or work.deferred:
+                    finalize(work)
+                    continue
+                if work.after:
+                    pending_after.append(work)
+                    continue
+                if fallback_titles and work.seen_people:
+                    work.used_fallback = True
+                    _apply_people(
+                        work,
+                        work.last_source or "prospeo_search",
+                        work.seen_people,
+                        titles=fallback_titles,
+                        fallback=True,
+                    )
+                finalize(work)
+            if should_pause_for_spend(
+                int(stats["companies_done"]), spent, int(stats["written"])
+            ):
+                deferred = True
+                pause_reason = "spending_without_output"
+                stats["pause_reason"] = pause_reason
+                finalize_rest(pending_prospeo[index + FLUSH_EVERY :], as_deferred=True)
+                break
+            index += FLUSH_EVERY
+        if deferred:
+            finalize_rest(
+                [w for w in pending_prospeo if not w.finished],
+                as_deferred=True,
+            )
+    elif pending_prospeo:
+        finalize_rest(pending_prospeo, as_deferred=True)
 
     if pending_after and not deferred:
         for i, work in enumerate(pending_after):
@@ -1199,12 +1436,17 @@ def resolve_people(
         "max_tier": max_tier,
         "skip_tiers": skipped,
         "selected_tiers": list(allowed),
+        "deprecated_tiers": deprecated_tiers,
+        "unrecognized_tiers": unrecognized_tiers,
+        "warnings": tier_notes,
         "per_tier": stats["per_tier"],
         "tier_order": order,
         "live_rates": {
-            "leadmagic_per_credit": rates.leadmagic_per_credit,
-            "leadmagic_credits": rates.leadmagic_credits,
-            "leadmagic_plan": rates.leadmagic_plan,
+            "aiark_per_credit": rates.aiark_per_credit,
+            "aiark_credits": rates.aiark_credits,
+            "prospeo_per_credit": rates.prospeo_per_credit,
+            "prospeo_credits": rates.prospeo_credits,
+            "prospeo_plan": rates.prospeo_plan,
             "notes": rates.notes,
         },
         "handoff": handoff_result,
