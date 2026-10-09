@@ -40,8 +40,10 @@ set profile = profile - 'tier_order'
 where client_tag = 'goliath'
   and jsonb_typeof(profile->'tier_order'->0) = 'object';
 
--- Optional: persist AI Ark person id so Email Waterfall can export/single
--- by id. Safe ADD COLUMN. Never touches dl_status / sg_exclude / skip_*.
+-- Optional columns: persist AI Ark person id (and 012 quality fields if
+-- that migration was never applied). ADD COLUMN IF NOT EXISTS only.
+-- Unique index is a SEPARATE function. A unique-index failure must never
+-- roll back aiark_person_id. Never touches dl_status / sg_exclude / skip_*.
 create or replace function public.pw_ensure_contacts_columns(
   p_table text
 ) returns void
@@ -51,7 +53,6 @@ set search_path to 'public'
 as $function$
 declare
   tbl text;
-  idx text;
 begin
   tbl := lower(regexp_replace(coalesce(p_table, ''), '[^a-z0-9_]', '', 'g'));
   if tbl = '' then
@@ -78,6 +79,9 @@ begin
          person_city text,
          person_state text,
          email text,
+         email_type text,
+         page_url text,
+         honorific text,
          client_tag text,
          created_at timestamptz NOT NULL DEFAULT now(),
          updated_at timestamptz NOT NULL DEFAULT now()
@@ -102,6 +106,9 @@ begin
   execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS person_city text', tbl);
   execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS person_state text', tbl);
   execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS email text', tbl);
+  execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS email_type text', tbl);
+  execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS page_url text', tbl);
+  execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS honorific text', tbl);
   execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS client_tag text', tbl);
   execute format('ALTER TABLE public.%I ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()', tbl);
   execute format(
@@ -118,13 +125,68 @@ begin
          OR last_name_key IS DISTINCT FROM lower(coalesce(last_name, ''''))',
     tbl
   );
+  -- No unique index here. See pw_ensure_contacts_unique_index.
+end;
+$function$;
+
+-- Separate RPC so a duplicate-key index failure cannot roll back ADD COLUMN.
+-- Skips and reports when (client_tag, domain, first_name_key, last_name_key)
+-- already has duplicates. Does not delete rows.
+create or replace function public.pw_ensure_contacts_unique_index(
+  p_table text
+) returns text
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  tbl text;
+  idx text;
+  dupes integer := 0;
+begin
+  tbl := lower(regexp_replace(coalesce(p_table, ''), '[^a-z0-9_]', '', 'g'));
+  if tbl = '' then
+    raise exception 'contacts table name is required';
+  end if;
+  if to_regclass(format('public.%I', tbl)) is null then
+    return 'skipped_missing_table';
+  end if;
+  begin
+    execute format(
+      'SELECT count(*) FROM (
+         SELECT 1
+           FROM public.%I
+          GROUP BY client_tag, domain, first_name_key, last_name_key
+         HAVING count(*) > 1
+       ) d',
+      tbl
+    ) into dupes;
+  exception
+    when undefined_column or undefined_table then
+      raise notice 'pw_ensure_contacts_unique_index: skipped %; missing key columns', tbl;
+      return 'skipped_missing_columns';
+  end;
+  if coalesce(dupes, 0) > 0 then
+    raise notice 'pw_ensure_contacts_unique_index: skipped %; % duplicate person keys', tbl, dupes;
+    return format('skipped_duplicates:%s', dupes);
+  end if;
   idx := tbl || '_person_uidx';
-  execute format(
-    'CREATE UNIQUE INDEX IF NOT EXISTS %I
-       ON public.%I (client_tag, domain, first_name_key, last_name_key)',
-    idx,
-    tbl
-  );
+  begin
+    execute format(
+      'CREATE UNIQUE INDEX IF NOT EXISTS %I
+         ON public.%I (client_tag, domain, first_name_key, last_name_key)',
+      idx,
+      tbl
+    );
+    return 'created';
+  exception
+    when unique_violation then
+      raise notice 'pw_ensure_contacts_unique_index: skipped %; unique_violation', tbl;
+      return 'skipped_duplicates:unique_violation';
+    when others then
+      raise notice 'pw_ensure_contacts_unique_index: skipped %; %', tbl, sqlerrm;
+      return format('skipped_error:%s', sqlerrm);
+  end;
 end;
 $function$;
 
