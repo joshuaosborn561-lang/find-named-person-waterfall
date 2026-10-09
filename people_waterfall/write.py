@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -11,6 +13,8 @@ from .people import PersonHit, normalize_name
 from .profile import ClientProfile
 from .source import split_qualified
 from .titles import TitleAudit
+
+log = logging.getLogger("people_waterfall.write")
 
 WRITE_CHUNK = 500
 WRITE_ATTEMPTS = 3
@@ -44,6 +48,20 @@ CONTACT_COLUMNS = (
     "email",
 )
 FORBIDDEN = ("dl_status", "sg_exclude")
+
+# Columns added by unapplied migrations (012 email_type/page_url/honorific,
+# 013 aiark_person_id). Prod tables without them reject the whole upsert
+# (PGRST204). Detect from the error and retry without that column. Writer
+# is tolerant; we do not require applying 012/013 to persist a contact.
+OPTIONAL_CONTACT_COLUMNS = frozenset(
+    {
+        "email_type",
+        "page_url",
+        "honorific",
+        "aiark_person_id",
+    }
+)
+_MISSING_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column")
 
 
 def _now() -> str:
@@ -168,6 +186,51 @@ def _contact_keys(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def drop_absent_optional_columns(
+    rows: list[dict[str, Any]],
+    absent: set[str] | frozenset[str],
+) -> list[dict[str, Any]]:
+    if not absent:
+        return rows
+    skip = set(absent)
+    return [{key: value for key, value in row.items() if key not in skip} for row in rows]
+
+
+def missing_optional_column_from_error(exc: BaseException) -> str | None:
+    match = _MISSING_COLUMN_RE.search(str(exc))
+    if not match:
+        return None
+    col = match.group(1)
+    if col in OPTIONAL_CONTACT_COLUMNS:
+        return col
+    return None
+
+
+def upsert_contacts_tolerant(table: str, rows: list[dict[str, Any]]) -> int:
+    """REST upsert that skips optional columns PostgREST says are missing."""
+    pending = [dict(row) for row in rows]
+    stripped: set[str] = set()
+    while True:
+        try:
+            return supabase_sync.rest_upsert(
+                table,
+                pending,
+                on_conflict=CONTACTS_CONFLICT,
+                batch_size=WRITE_CHUNK,
+            )
+        except RuntimeError as exc:
+            col = missing_optional_column_from_error(exc)
+            if not col or col in stripped:
+                raise
+            log.warning(
+                "contacts write skipping missing optional column %s on %s",
+                col,
+                table,
+            )
+            stripped.add(col)
+            pending = drop_absent_optional_columns(pending, {col})
+
+
 _PUBLIC_CONTACT_SKIP = ("source", "source_url")
 
 
@@ -215,18 +278,20 @@ def write_contacts(profile: ClientProfile, rows: list[dict[str, Any]]) -> int:
         )
     except RuntimeError:
         pass
+    try:
+        supabase_sync.rpc(
+            "pw_ensure_contacts_unique_index",
+            {"p_table": table},
+        )
+    except RuntimeError:
+        pass
     public_rows = [
         {key: value for key, value in row.items() if key not in _PUBLIC_CONTACT_SKIP}
         for row in prepared
     ]
     return _write_chunks(
         public_rows,
-        lambda chunk: supabase_sync.rest_upsert(
-            table,
-            chunk,
-            on_conflict=CONTACTS_CONFLICT,
-            batch_size=WRITE_CHUNK,
-        ),
+        lambda chunk: upsert_contacts_tolerant(table, chunk),
     )
 
 
