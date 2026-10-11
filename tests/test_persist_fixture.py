@@ -8,7 +8,14 @@ from people_waterfall.profile import parse_profile
 from people_waterfall.source import TableSource
 from people_waterfall.vendors.discolike import DiscoDomainResult
 from people_waterfall.waterfall import VendorBundle, resolve_people
-from people_waterfall.write import dedupe_person_rows, load_known_names
+from people_waterfall.write import (
+    contact_payload,
+    dedupe_person_rows,
+    drop_absent_optional_columns,
+    load_known_names,
+    missing_optional_column_from_error,
+    upsert_contacts_tolerant,
+)
 
 PROFILE = parse_profile(
     "emcor",
@@ -215,6 +222,7 @@ def test_write_contacts_upserts_on_person_key(monkeypatch):
         assert name in {
             "pw_ensure_contacts_columns",
             "pw_ensure_contact_quality_columns",
+            "pw_ensure_contacts_unique_index",
         }
         assert body["p_table"] == "emcor_wf_contacts"
 
@@ -255,6 +263,144 @@ def test_write_contacts_upserts_on_person_key(monkeypatch):
     assert seen["rows"][0]["first_name_key"] == "jane"
     assert seen["rows"][0]["last_name_key"] == "doe"
     assert seen["rows"][0]["title_rank"] == 0
+
+
+def test_drop_absent_optional_columns_keeps_required():
+    rows = [
+        {
+            "email": "a@x.com",
+            "email_type": "personal",
+            "page_url": "https://x.com/team",
+            "aiark_person_id": "p1",
+            "first_name": "Ann",
+        }
+    ]
+    out = drop_absent_optional_columns(rows, {"email_type", "page_url"})
+    assert out == [
+        {"email": "a@x.com", "aiark_person_id": "p1", "first_name": "Ann"}
+    ]
+    assert drop_absent_optional_columns(rows, set()) == rows
+
+
+def test_missing_optional_column_from_pgrst204():
+    err = RuntimeError(
+        "Supabase POST failed (400): {\"code\":\"PGRST204\","
+        "\"message\":\"Could not find the 'email_type' column of "
+        "'emcor_wf_contacts' in the schema cache\"}"
+    )
+    assert missing_optional_column_from_error(err) == "email_type"
+    required = RuntimeError(
+        "Supabase POST failed (400): {\"code\":\"PGRST204\","
+        "\"message\":\"Could not find the 'domain' column of "
+        "'emcor_wf_contacts' in the schema cache\"}"
+    )
+    assert missing_optional_column_from_error(required) is None
+
+
+def test_upsert_contacts_retries_without_missing_optional(monkeypatch):
+    from people_waterfall import write as write_mod
+    from people_waterfall.titles import TitleAudit
+
+    attempts: list[list[str]] = []
+
+    def upsert(table, rows, *, on_conflict, batch_size=200):
+        keys = sorted({key for row in rows for key in row})
+        attempts.append(keys)
+        if any("email_type" in row for row in rows):
+            raise RuntimeError(
+                "Supabase POST failed (400): {\"code\":\"PGRST204\","
+                "\"message\":\"Could not find the 'email_type' column of "
+                "'emcor_wf_contacts' in the schema cache\"}"
+            )
+        return len(rows)
+
+    monkeypatch.setattr(write_mod.supabase_sync, "rest_upsert", upsert)
+    n = upsert_contacts_tolerant(
+        "emcor_wf_contacts",
+        [
+            {
+                "first_name": "Ann",
+                "email": "a@x.com",
+                "email_type": "personal",
+                "domain": "x.com",
+            }
+        ],
+    )
+    assert n == 1
+    assert "email_type" in attempts[0]
+    assert "email_type" not in attempts[1]
+    assert "email" in attempts[1]
+
+    person = PersonHit(
+        first_name="Ann",
+        last_name="Lee",
+        email="a@x.com",
+        email_type="personal",
+        page_url="https://x.com/team",
+    )
+    payload = contact_payload(
+        person,
+        TitleAudit(
+            title_match=True,
+            title_rank=0,
+            normalized_title="owner",
+            excluded=False,
+            below_floor=False,
+        ),
+        client_tag="emcor",
+        company_name="X",
+        domain="x.com",
+        source_tier="site_staff",
+        source_confidence=1.0,
+    )
+    assert payload["email_type"] == "personal"
+
+
+def test_write_contacts_succeeds_when_email_type_column_missing(monkeypatch):
+    from people_waterfall import write as write_mod
+    from people_waterfall.titles import TitleAudit
+
+    seen: dict = {}
+
+    def rpc(name, body):
+        assert name in {
+            "pw_ensure_contacts_columns",
+            "pw_ensure_contact_quality_columns",
+            "pw_ensure_contacts_unique_index",
+        }
+
+    def upsert(table, rows, *, on_conflict, batch_size=200):
+        if any("email_type" in row for row in rows):
+            raise RuntimeError(
+                "Supabase POST failed (400): {\"code\":\"PGRST204\","
+                "\"message\":\"Could not find the 'email_type' column of "
+                f"'{table}' in the schema cache\"}}"
+            )
+        seen["rows"] = rows
+        return len(rows)
+
+    monkeypatch.setattr(write_mod.supabase_sync, "rpc", rpc)
+    monkeypatch.setattr(write_mod.supabase_sync, "rest_upsert", upsert)
+    profile = parse_profile("emcor", {"contacts_table": "public.emcor_wf_contacts"})
+    row = contact_payload(
+        PersonHit(first_name="Ann", last_name="Lee", email_type="personal"),
+        TitleAudit(
+            title_match=True,
+            title_rank=0,
+            normalized_title="owner",
+            excluded=False,
+            below_floor=False,
+        ),
+        client_tag="emcor",
+        company_name="X",
+        domain="x.com",
+        source_tier="site_staff",
+        source_confidence=1.0,
+    )
+    n = write_mod.write_contacts(profile, [row])
+    assert n == 1
+    assert "email_type" not in seen["rows"][0]
+    assert seen["rows"][0]["first_name"] == "Ann"
 
 
 def test_dedupe_keeps_best_title_rank():

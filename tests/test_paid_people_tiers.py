@@ -7,7 +7,11 @@ from people_waterfall.pricing import LiveRates
 from people_waterfall.profile import parse_profile
 from people_waterfall.source import TableSource
 from people_waterfall.vendors.aiark import AiArkPeopleClient, TitlesRequired
-from people_waterfall.vendors.prospeo import ProspeoSearchClient, websites_of_company
+from people_waterfall.vendors.prospeo import (
+    ProspeoSearchClient,
+    search_person_filters,
+    websites_of_company,
+)
 from people_waterfall.waterfall import VendorBundle, resolve_people
 from people_waterfall.site_quality import registrable_domain
 
@@ -248,7 +252,7 @@ def test_prospeo_strips_subdomains_and_caps_three(monkeypatch):
         max_per_company=3,
     )
     websites = posted[0]["filters"]["company"]["websites"]
-    assert websites == ["acme.com"]
+    assert websites == {"include": ["acme.com"]}
     assert len(packed["acme.com"]) == 3
     assert client.last_credits_used == 1.0
 
@@ -266,7 +270,7 @@ def test_prospeo_cover_loop_requeries_only_uncovered(monkeypatch):
             return {"results": self._rows}
 
     def fake_post(tier, url, **kwargs):
-        sites = list((kwargs.get("json") or {})["filters"]["company"]["websites"])
+        sites = list((kwargs.get("json") or {})["filters"]["company"]["websites"]["include"])
         pages.append(sites)
         if "beta.com" in sites and len(pages) == 1:
             return _Resp(
@@ -337,3 +341,31 @@ def test_websites_of_company_uses_other_websites():
         {"website": "https://www.foo.com/about", "other_websites": ["shop.foo.com"]}
     )
     assert hosts == ["foo.com"]
+
+
+def test_prospeo_search_page_sends_websites_include(monkeypatch):
+    """Docs: filters.company.websites.include — a bare list matches nothing."""
+    body = search_person_filters(["acme.com", "beta.com"], ["Owner", "President"])
+    assert body["company"] == {"websites": {"include": ["acme.com", "beta.com"]}}
+    assert body["company"]["websites"] != ["acme.com", "beta.com"]
+    assert body["person_job_title"]["include"] == ["Owner", "President"]
+
+    client = ProspeoSearchClient(api_key="tok")
+    posted: list[dict] = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"results": []}
+
+    def fake_post(tier, url, **kwargs):
+        posted.append(kwargs.get("json") or {})
+        return _Resp()
+
+    monkeypatch.setattr("people_waterfall.vendors.prospeo.http_client.post", fake_post)
+    client._search_page(["acme.com"], ["Owner"])
+    sent = posted[0]
+    assert sent["page"] == 1
+    assert sent["filters"]["company"] == {"websites": {"include": ["acme.com"]}}
+    assert "include" in sent["filters"]["company"]["websites"]

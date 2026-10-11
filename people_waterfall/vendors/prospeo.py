@@ -20,6 +20,23 @@ from people_waterfall.site_quality import registrable_domain
 MAX_WEBSITES = 500
 
 
+def search_person_filters(websites: list[str], titles: list[str]) -> dict[str, Any]:
+    """Prospeo /search-person filter body.
+
+    Official docs require company.websites.include (and names.include),
+    not a bare websites list. A list is ignored / matches nothing.
+    https://prospeo.io/api-docs/search-person
+    https://prospeo.io/api-docs/filters-documentation
+    """
+    return {
+        "company": {"websites": {"include": list(websites)}},
+        "person_job_title": {
+            "include": list(titles),
+            "match_mode": "CONTAINS",
+        },
+    }
+
+
 def websites_of_company(block: Any) -> list[str]:
     """Registrable hosts from company.website / domain / other_websites."""
     if not isinstance(block, dict):
@@ -148,13 +165,7 @@ class ProspeoSearchClient:
         returned at least one person (1 credit)."""
         body = {
             "page": 1,
-            "filters": {
-                "company": {"websites": websites},
-                "person_job_title": {
-                    "include": list(titles),
-                    "match_mode": "CONTAINS",
-                },
-            },
+            "filters": search_person_filters(websites, titles),
         }
         self.calls += 1
         self.pages += 1
