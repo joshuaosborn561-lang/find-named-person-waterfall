@@ -79,6 +79,8 @@ def _reload_settings() -> None:
         os.environ["AI_ARK_API_KEY"] = cfg.settings.ai_ark_api_key
     if cfg.settings.prospeo_api_key and not os.environ.get("PROSPEO_API_KEY"):
         os.environ["PROSPEO_API_KEY"] = cfg.settings.prospeo_api_key
+    if cfg.settings.getleads_api_key and not os.environ.get("GETLEADS_API_KEY"):
+        os.environ["GETLEADS_API_KEY"] = cfg.settings.getleads_api_key
 
 
 TOOL_NAMES = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from . import supabase_sync
@@ -16,11 +17,50 @@ from .source import (
     where_to_filters,
 )
 
+SITE_PAGES_REQUIRED = ("url", "body_text", "emails", "title")
+
 
 class ToolError(Exception):
     def __init__(self, message: str, stage: str) -> None:
         self.stage = stage
         super().__init__(message)
+
+
+def site_people_key() -> str:
+    """Read SITE_PEOPLE_KEY from the process env only. Never log the value."""
+    return (os.environ.get("SITE_PEOPLE_KEY") or "").strip()
+
+
+def require_site_people_key() -> str:
+    """Fail fast when site_people would run with a missing or empty key."""
+    key = site_people_key()
+    if not key:
+        raise ToolError(
+            "SITE_PEOPLE_KEY is missing or empty; site_people cannot run with an empty key",
+            "site_people_key",
+        )
+    return key
+
+
+def preflight_selected_tiers(tiers: list[str]) -> None:
+    """Refuse a selected site_people window before any vendor call."""
+    if "site_people" in {str(t) for t in tiers}:
+        require_site_people_key()
+
+
+def preflight_site_staff_columns() -> None:
+    """site_staff cannot run when public.site_pages is missing required columns."""
+    try:
+        cols = _columns("public", "site_pages")
+    except ToolError:
+        raise
+    missing = [name for name in SITE_PAGES_REQUIRED if name not in cols]
+    if missing:
+        raise ToolError(
+            "site_staff requires public.site_pages columns "
+            f"{', '.join(SITE_PAGES_REQUIRED)}; missing {', '.join(missing)}",
+            "site_staff",
+        )
 
 
 def _columns(schema: str, table: str) -> set[str]:

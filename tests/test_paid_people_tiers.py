@@ -14,6 +14,7 @@ from people_waterfall.vendors.prospeo import (
 )
 from people_waterfall.waterfall import VendorBundle, resolve_people
 from people_waterfall.site_quality import registrable_domain
+from tests.fakes import EmptyGetleads, EmptySitePeople
 
 
 PROFILE = parse_profile(
@@ -110,6 +111,7 @@ def _run(monkeypatch, rows, vendors, profile=PROFILE, **kwargs):
     monkeypatch.setattr(wf, "writeback_people", lambda *a, **k: None)
     monkeypatch.setattr(wf, "persist_discolike_icp", lambda *a, **k: None)
     monkeypatch.setattr(wf, "merge_people_measured_rates", lambda *a, **k: None)
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-site-people-key")
     return resolve_people(
         source_table="public.emcor_companies",
         where="domain is not null",
@@ -125,18 +127,25 @@ def test_goliath_custom_order_warns_on_unrecognized_and_legacy(monkeypatch):
     result = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=_NoopPaid(), aiark=_NoopPaid()),
+        VendorBundle(
+            cache=_Empty(),
+            discolike=_Disco(),
+            site_people=EmptySitePeople(),
+            getleads=EmptyGetleads(),
+            prospeo=_NoopPaid(),
+            aiark=_NoopPaid(),
+        ),
         profile=GOLIATH,
         estimate_only=True,
     )
-    assert "getleads" in result["unrecognized_tiers"]
+    assert "getleads" not in result["unrecognized_tiers"]
     assert "aiark" in result["unrecognized_tiers"]
     assert "prospeo" in result["unrecognized_tiers"]
     assert "leadmagic_employee" in result["deprecated_tiers"]
     assert "leadmagic_role" in result["deprecated_tiers"]
     assert any("unrecognized" in w for w in result["warnings"])
     assert any("deprecated" in w for w in result["warnings"])
-    assert result["selected_tiers"] == ["site_staff", "cache"]
+    assert result["selected_tiers"] == ["site_staff", "cache", "site_people", "getleads"]
 
 
 def test_legacy_skip_does_not_fail_the_job(monkeypatch):
@@ -144,7 +153,14 @@ def test_legacy_skip_does_not_fail_the_job(monkeypatch):
     result = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=_NoopPaid(), aiark=_NoopPaid()),
+        VendorBundle(
+            cache=_Empty(),
+            discolike=_Disco(),
+            site_people=EmptySitePeople(),
+            getleads=EmptyGetleads(),
+            prospeo=_NoopPaid(),
+            aiark=_NoopPaid(),
+        ),
         skip_tiers="leadmagic_employee,lm",
         max_tier="discolike",
     )
@@ -167,7 +183,14 @@ def test_aiark_job_refuses_without_profile_titles(monkeypatch):
         _run(
             monkeypatch,
             rows,
-            VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=_NoopPaid(), aiark=_NoopPaid()),
+            VendorBundle(
+                cache=_Empty(),
+                discolike=_Disco(),
+                site_people=EmptySitePeople(),
+                getleads=EmptyGetleads(),
+                prospeo=_NoopPaid(),
+                aiark=_NoopPaid(),
+            ),
             profile=bare,
             min_tier="aiark_people",
             max_tier="aiark_people",
@@ -316,7 +339,14 @@ def test_approve_cost_ceiling_defers_before_spend(monkeypatch):
     result = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=_NoopPaid(), aiark=_NoopPaid()),
+        VendorBundle(
+            cache=_Empty(),
+            discolike=_Disco(),
+            site_people=EmptySitePeople(),
+            getleads=EmptyGetleads(),
+            prospeo=_NoopPaid(),
+            aiark=_NoopPaid(),
+        ),
         estimate_only=True,
         approve_cost_usd=0.001,
     )
@@ -327,7 +357,14 @@ def test_approve_cost_ceiling_defers_before_spend(monkeypatch):
     ran = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=_NoopPaid(), aiark=_NoopPaid()),
+        VendorBundle(
+            cache=_Empty(),
+            discolike=_Disco(),
+            site_people=EmptySitePeople(),
+            getleads=EmptyGetleads(),
+            prospeo=_NoopPaid(),
+            aiark=_NoopPaid(),
+        ),
         estimate_only=False,
         approve_cost_usd=0.001,
     )

@@ -99,6 +99,7 @@ class ClientProfile:
     people_dropped_tiers: list[str] = field(default_factory=list)
     people_measured_rates: dict[str, Any] = field(default_factory=dict)
     discolike_icp_text: str = ""
+    site_pick_titles: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     # Domain Waterfall owns these shared keys. Kept for display only.
@@ -154,6 +155,7 @@ class ClientProfile:
             "people_dropped_tiers": list(self.people_dropped_tiers),
             "people_measured_rates": dict(self.people_measured_rates),
             "discolike_icp_text": self.discolike_icp_text,
+            "site_pick_titles": list(self.site_pick_titles),
             "domain_tier_order": list(self.domain_tier_order),
             "contacts_table": self.contacts_table,
         }
@@ -184,6 +186,7 @@ def parse_profile(client_tag: str, doc: dict[str, Any] | None) -> ClientProfile:
         people_dropped_tiers=_people_dropped_tiers(doc),
         people_measured_rates=_people_measured_rates(doc),
         discolike_icp_text=str(doc.get("discolike_icp_text") or "").strip(),
+        site_pick_titles=_as_list(doc.get("site_pick_titles")),
         raw=doc,
     )
 

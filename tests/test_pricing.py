@@ -11,25 +11,29 @@ from people_waterfall.pricing import (
 
 
 NEW_DEFAULT = [
-    "site_staff",
     "cache",
+    "site_people",
+    "getleads",
     "discolike",
     "prospeo_search",
     "aiark_people",
 ]
 
 
-def test_default_order_is_site_staff_then_paid_tiers():
+def test_default_order_is_cache_then_site_people_then_paid_tiers():
     rates = LiveRates(aiark_per_credit=0.003667, prospeo_per_credit=0.0148)
     order = compute_tier_order(rates=rates)
     names = [r["tier"] for r in order if not r["dropped"]]
     assert names == NEW_DEFAULT
     assert DEFAULT_ORDER == NEW_DEFAULT
-    assert set(PUBLISHED) == set(NEW_DEFAULT)
+    assert set(NEW_DEFAULT) <= set(PUBLISHED)
+    assert "site_staff" in PUBLISHED
     assert "leadmagic_employee" not in PUBLISHED
     assert "leadmagic_role" not in PUBLISHED
-    assert rates.unit_usd("site_staff") == 0.0
+    assert rates.unit_usd("site_people") == 0.0
+    assert rates.unit_usd("getleads") == 0.0
     assert select_tiers(order, max_tier="site_staff") == ["site_staff"]
+    assert select_tiers(order, max_tier="site_people") == ["cache", "site_people"]
     assert rates.unit_usd("prospeo_search") == 0.0148
     assert abs(rates.unit_usd("aiark_people") - 0.5 * 0.003667) < 1e-9
 
@@ -53,14 +57,14 @@ def test_unknown_tiers_are_warned_not_silent():
             {"tier": "discolike"},
         ]
     )
-    assert planned.include == ["cache", "discolike"]
-    assert planned.unrecognized == ["getleads", "smartlead", "aiark", "serp", "prospeo"]
+    assert planned.include == ["cache", "getleads", "discolike"]
+    assert planned.unrecognized == ["smartlead", "aiark", "serp", "prospeo"]
     assert planned.deprecated == []
     assert any("unrecognized" in note for note in planned.notes)
     rates = LiveRates()
     order = compute_tier_order(rates=rates, include=planned.include)
     names = [r["tier"] for r in order if not r["dropped"]]
-    assert names == ["site_staff", "cache", "discolike"]
+    assert names == ["cache", "site_people", "getleads", "discolike"]
 
 
 def test_legacy_leadmagic_names_are_noop_with_warning():
@@ -80,6 +84,10 @@ def test_legacy_leadmagic_names_are_noop_with_warning():
     assert "leadmagic_role" in planned.deprecated
     assert any("deprecated" in note for note in planned.notes)
     assert include_from_profile(planned.include) == ["site_staff", "cache", "discolike"]
+    rates = LiveRates()
+    order = compute_tier_order(rates=rates, include=planned.include)
+    names = [r["tier"] for r in order if not r["dropped"]]
+    assert names == ["site_staff", "cache", "site_people", "discolike"]
 
 
 def test_skip_tiers_legacy_leadmagic_is_noop():
@@ -107,7 +115,7 @@ def test_zero_yield_dropped_not_reordered():
     )
     names = [r["tier"] for r in order if not r["dropped"]]
     assert "discolike" not in names
-    assert names == ["site_staff", "cache", "prospeo_search", "aiark_people"]
+    assert names == ["cache", "site_people", "getleads", "prospeo_search", "aiark_people"]
 
 
 def test_select_tiers_can_run_discolike_alone():
