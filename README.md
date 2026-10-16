@@ -35,7 +35,9 @@ It never reads or writes the domain resolver's shared `tier_order`.
 A missing or empty key fails the job before any fetch. Do not store
 the key on `Settings` or print it. Set it on the Railway service
 before deploy, and do not deploy while a `resolve_people` job is
-running.
+running. Fetch/extract edge calls run in a pool sized by
+`SITE_PEOPLE_CONCURRENCY` (default 6, max 12). Connection-slot,
+429, and 5xx responses back off with jitter and shrink the pool.
 
 ## Writes
 

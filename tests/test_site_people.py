@@ -1,19 +1,28 @@
 """site_people load/pick/unpicked, DiscoLike filter, and missing-key fail-fast."""
 
+import threading
+import time
+
 import pytest
+import requests
 
 from people_waterfall.people import PersonHit
 from people_waterfall.preflight import ToolError, require_site_people_key, site_people_key
 from people_waterfall.pricing import LiveRates
 from people_waterfall.profile import parse_profile
 from people_waterfall.source import TableSource
+from people_waterfall.vendors import site_people as site_people_mod
 from people_waterfall.vendors.site_people import (
     CUT_ORG_TYPES,
     SitePeopleBatchResult,
     SitePeopleClient,
     SitePeopleDomainResult,
+    _HttpPressure,
+    _SlotBusy,
     batch_name,
     discolike_eligible,
+    plan_wave,
+    pressure_backoff_s,
     title_ignored,
     whole_word_rank,
 )
@@ -414,3 +423,263 @@ def test_client_refuses_empty_key_before_http(monkeypatch):
     with pytest.raises(ToolError, match="SITE_PEOPLE_KEY is missing or empty"):
         client.resolve_domains(["acme.com"], batch="fnp_x_1")
     assert client.calls == 0
+
+
+class _Resp:
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {}
+
+
+def test_plan_wave_splits_small_flush_across_pool():
+    assert plan_wave(50, 70, 6) == (6, 9)
+    assert plan_wave(1000, 70, 6) == (6, 70)
+    assert plan_wave(0, 70, 6) == (0, 70)
+    assert plan_wave(3, 70, 6) == (3, 1)
+    assert plan_wave(12, 70, 12) == (12, 1)
+
+
+def test_pressure_backoff_includes_jitter(monkeypatch):
+    monkeypatch.setattr(site_people_mod.random, "uniform", lambda a, b: 0.25)
+    slot = pressure_backoff_s("slot", 1)
+    http = pressure_backoff_s("http", 1)
+    assert slot == pytest.approx(60.25)
+    assert http == pytest.approx(5.25)
+    assert pressure_backoff_s("http", 2) == pytest.approx(10.25)
+
+
+def test_call_edge_classifies_slot_429_and_5xx(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    client = SitePeopleClient()
+
+    monkeypatch.setattr(
+        site_people_mod.requests,
+        "get",
+        lambda *a, **k: _Resp(200, "remaining connection slots are reserved"),
+    )
+    with pytest.raises(_SlotBusy):
+        client._call_edge(mode="fetch", batch="fnp_t_1", n=8, w=8)
+
+    monkeypatch.setattr(
+        site_people_mod.requests, "get", lambda *a, **k: _Resp(429, "slow down")
+    )
+    with pytest.raises(_HttpPressure, match="429"):
+        client._call_edge(mode="fetch", batch="fnp_t_1", n=8, w=8)
+
+    monkeypatch.setattr(
+        site_people_mod.requests, "get", lambda *a, **k: _Resp(503, "unavailable")
+    )
+    with pytest.raises(_HttpPressure, match="503"):
+        client._call_edge(mode="extract", batch="fnp_t_1", n=8, w=8)
+
+    monkeypatch.setattr(
+        site_people_mod.requests, "get", lambda *a, **k: _Resp(400, "bad batch")
+    )
+    with pytest.raises(RuntimeError, match="400"):
+        client._call_edge(mode="fetch", batch="fnp_t_1", n=8, w=8)
+
+
+def test_poll_fetch_runs_edge_calls_in_parallel(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "6")
+    left = {"n": 12}
+    lock = threading.Lock()
+    active = {"n": 0, "max": 0}
+    ns: list[int] = []
+
+    def fake_remaining(batch):
+        with lock:
+            return {"fetch_remaining": left["n"], "extract_remaining": 0}
+
+    def fake_edge(*, mode, batch, n, w):
+        with lock:
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+            ns.append(n)
+            take = min(n, left["n"])
+            left["n"] -= take
+        time.sleep(0.08)
+        with lock:
+            active["n"] -= 1
+        return "ok"
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", fake_remaining)
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    client.poll_fetch("fnp_t_pool")
+    assert left["n"] == 0
+    assert active["max"] >= 2
+    assert active["max"] <= 6
+    assert client.wave_sizes[0] <= 6
+    assert ns
+    assert max(ns) <= 70
+
+
+def test_slot_pressure_backs_off_and_reduces_limit(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "6")
+    sleeps: list[float] = []
+    monkeypatch.setattr(site_people_mod.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(site_people_mod.random, "uniform", lambda a, b: 0.0)
+    left = {"n": 1}
+    pressure = {"n": 1}
+
+    def fake_remaining(batch):
+        return {"fetch_remaining": left["n"]}
+
+    def fake_edge(*, mode, batch, n, w):
+        if pressure["n"] > 0:
+            pressure["n"] -= 1
+            raise _SlotBusy("remaining connection slots are reserved")
+        take = min(n, left["n"])
+        left["n"] -= take
+        return "ok"
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", fake_remaining)
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    client.poll_fetch("fnp_t_slot")
+    assert sleeps
+    assert sleeps[0] >= 60.0
+    assert client._live_limit == 3
+    assert left["n"] == 0
+
+
+def test_http_pressure_reduces_limit_instead_of_fanning_out(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "8")
+    sleeps: list[float] = []
+    monkeypatch.setattr(site_people_mod.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(site_people_mod.random, "uniform", lambda a, b: 0.0)
+    left = {"n": 1}
+    pressure = {"n": 1}
+
+    def fake_remaining(batch):
+        return {"fetch_remaining": left["n"]}
+
+    def fake_edge(*, mode, batch, n, w):
+        if pressure["n"] > 0:
+            pressure["n"] -= 1
+            raise _HttpPressure("site-people fetch failed (429): slow down")
+        left["n"] -= min(n, left["n"])
+        return "ok"
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", fake_remaining)
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    client.poll_fetch("fnp_t_429")
+    assert sleeps
+    assert client._live_limit == 4
+    client.poll_extract("fnp_t_429")
+    assert client._live_limit == 4
+
+
+def test_reduced_limit_does_not_fan_out(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "6")
+    left = {"n": 8}
+    lock = threading.Lock()
+    active = {"n": 0, "max": 0}
+
+    def fake_remaining(batch):
+        with lock:
+            return {"fetch_remaining": left["n"]}
+
+    def fake_edge(*, mode, batch, n, w):
+        with lock:
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+            left["n"] -= min(n, left["n"])
+        time.sleep(0.05)
+        with lock:
+            active["n"] -= 1
+        return "ok"
+
+    client = SitePeopleClient()
+    client._live_limit = 1
+    monkeypatch.setattr(client, "remaining", fake_remaining)
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    client.poll_fetch("fnp_t_nofan")
+    assert left["n"] == 0
+    assert active["max"] == 1
+    assert all(size <= 1 for size in client.wave_sizes)
+
+
+def test_pressure_exhaust_raises(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "4")
+    monkeypatch.setattr(site_people_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(site_people_mod.random, "uniform", lambda a, b: 0.0)
+
+    def fake_remaining(batch):
+        return {"fetch_remaining": 1}
+
+    def fake_edge(*, mode, batch, n, w):
+        raise _SlotBusy("remaining connection slots are reserved")
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", fake_remaining)
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    with pytest.raises(RuntimeError, match="exhausted connection-slot backoff"):
+        client.poll_fetch("fnp_t_exhaust")
+    assert client._live_limit == 1
+
+
+def test_resolve_domains_keeps_db_writes_batched(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    posted: list[str] = []
+    hosts = [f"site-{i}.test" for i in range(6)]
+
+    def fake_rpc(name, body=None):
+        posted.append(name)
+        if name == "pw_site_people_load":
+            assert body["p_domains"] == hosts
+            return {"loaded": len(hosts), "reused": 0, "reset": 0, "inserted": len(hosts)}
+        if name == "pw_site_people_remaining":
+            return {
+                "fetch_remaining": 0,
+                "extract_remaining": 0,
+                "fetched_ok": len(hosts),
+                "extracted_ok": len(hosts),
+                "dollars": 0.0,
+            }
+        if name == "pw_site_people_roster":
+            return [
+                {
+                    "domain": host,
+                    "person_key": "",
+                    "full_name": "",
+                    "title": "",
+                    "org_name": "",
+                    "org_type": "",
+                    "fetched": True,
+                    "extracted": True,
+                }
+                for host in hosts
+            ]
+        if name == "pw_site_people_picks":
+            return []
+        return {}
+
+    monkeypatch.setattr("people_waterfall.vendors.site_people.supabase_sync.rpc", fake_rpc)
+    client = SitePeopleClient()
+    packed = client.resolve_domains(hosts, batch="fnp_t_batch")
+    assert packed.loaded == 6
+    assert posted.count("pw_site_people_load") == 1
+    assert posted.count("pw_site_people_roster") == 1
+    assert posted.count("pw_site_people_picks") == 1
+    assert "pw_site_people_load" == posted[0]
+
+
+def test_call_edge_treats_request_exception_as_pressure(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    client = SitePeopleClient()
+
+    def boom(*args, **kwargs):
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr(site_people_mod.requests, "get", boom)
+    with pytest.raises(_HttpPressure, match="request failed"):
+        client._call_edge(mode="fetch", batch="fnp_t_1", n=8, w=8)
+    assert "test-key" not in (client.last_error or "")

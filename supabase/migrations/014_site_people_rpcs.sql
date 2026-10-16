@@ -11,6 +11,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path TO 'public', 'topup'
 AS $function$
+#variable_conflict use_variable
 DECLARE
   batch text;
   reuse interval;
@@ -86,6 +87,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path TO 'public', 'topup'
 AS $function$
+#variable_conflict use_variable
 DECLARE
   batch text;
   fetch_left int;
@@ -150,6 +152,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path TO 'public', 'topup'
 AS $function$
+#variable_conflict use_variable
 DECLARE
   batch text;
   result jsonb;
@@ -192,6 +195,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path TO 'public', 'topup'
 AS $function$
+#variable_conflict use_variable
 DECLARE
   batch text;
   result jsonb;

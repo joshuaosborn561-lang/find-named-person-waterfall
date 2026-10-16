@@ -7,14 +7,22 @@ Settings (repr leak) and never printed. An empty key fails before any HTTP.
 from __future__ import annotations
 
 import logging
+import random
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
-from people_waterfall import http_client, supabase_sync
+import requests
+
+from people_waterfall import supabase_sync
+from people_waterfall.concurrency import (
+    MAX_SITE_PEOPLE_CONCURRENCY,
+    site_people_concurrency,
+)
 from people_waterfall.config import settings
 from people_waterfall.people import PersonHit, split_name
 from people_waterfall.preflight import require_site_people_key, site_people_key
@@ -28,9 +36,9 @@ FETCH_N = 70
 FETCH_W = 8
 EXTRACT_N = 50
 EXTRACT_W = 10
-FETCH_IN_FLIGHT = 3
-EXTRACT_IN_FLIGHT = 2
 SLOT_BACKOFF_S = 60.0
+HTTP_BACKOFF_BASE_S = 5.0
+PRESSURE_EXHAUST = 8
 SLOT_MARKER = "remaining connection slots are reserved"
 CUT_ORG_TYPES = frozenset(
     {
@@ -130,6 +138,33 @@ class SitePeopleBatchResult:
     batch: str = ""
 
 
+def plan_wave(left: int, n_cap: int, limit: int) -> tuple[int, int]:
+    """Split remaining domains across the live worker limit.
+
+    Returns (workers, n_per_call). n_per_call never exceeds n_cap. Worker
+    count never exceeds `limit` or `left`, so a 50-domain flush can still
+    fill SITE_PEOPLE_CONCURRENCY instead of collapsing to one n=70 call.
+    """
+    remaining = max(0, int(left))
+    cap = max(1, int(n_cap))
+    pool = max(1, int(limit))
+    if remaining <= 0:
+        return 0, cap
+    workers = min(pool, remaining)
+    n_each = min(cap, max(1, (remaining + workers - 1) // workers))
+    workers = min(workers, max(1, (remaining + n_each - 1) // n_each))
+    return workers, n_each
+
+
+def pressure_backoff_s(kind: str, attempt: int) -> float:
+    """Sleep seconds after a slot-reserved / 429 / 5xx. Always jittered."""
+    hit = max(1, int(attempt))
+    if kind == "slot":
+        return SLOT_BACKOFF_S + random.uniform(0, 15.0)
+    delay = min(60.0, HTTP_BACKOFF_BASE_S * (2 ** (hit - 1)))
+    return delay + random.uniform(0, 0.5)
+
+
 class SitePeopleClient:
     tier = "site_people"
 
@@ -138,6 +173,9 @@ class SitePeopleClient:
         self.calls = 0
         self.last_error = ""
         self._enabled_override = enabled
+        self._state_lock = threading.Lock()
+        self._live_limit: int | None = None
+        self.wave_sizes: list[int] = []
 
     @property
     def enabled(self) -> bool:
@@ -150,31 +188,58 @@ class SitePeopleClient:
         qs = urlencode({"mode": mode, "batch": batch, "n": n, "w": w, "k": key})
         return f"{base}/functions/v1/site-people?{qs}"
 
+    def _bump_calls(self) -> None:
+        with self._state_lock:
+            self.calls += 1
+
+    def _set_last_error(self, text: str) -> None:
+        with self._state_lock:
+            self.last_error = text
+
+    def _live_concurrency(self) -> int:
+        env_limit = site_people_concurrency()
+        with self._state_lock:
+            if self._live_limit is None:
+                self._live_limit = env_limit
+            else:
+                self._live_limit = min(self._live_limit, env_limit)
+            return self._live_limit
+
+    def _reduce_concurrency(self) -> int:
+        with self._state_lock:
+            current = self._live_limit if self._live_limit is not None else site_people_concurrency()
+            self._live_limit = max(1, current // 2)
+            return self._live_limit
+
     def _call_edge(self, *, mode: str, batch: str, n: int, w: int) -> str:
         key = require_site_people_key()
         url = self._edge_url(mode=mode, batch=batch, n=n, w=w, key=key)
-        self.calls += 1
-        response = http_client.get(
-            self.tier,
-            url,
-            timeout=self.timeout,
-        )
-        body = ""
-        if response is not None:
-            try:
-                body = response.text or ""
-            except Exception:  # noqa: BLE001
-                body = ""
-            if response.status_code >= 400:
-                self.last_error = _redact(body or f"http {response.status_code}", key)
-                raise RuntimeError(
-                    f"site-people {mode} failed ({response.status_code}): {self.last_error}"
-                )
-        else:
-            self.last_error = "site-people request failed"
-            raise RuntimeError(self.last_error)
-        if SLOT_MARKER in body.lower() or SLOT_MARKER in (self.last_error or "").lower():
-            raise _SlotBusy(_redact(body, key))
+        self._bump_calls()
+        try:
+            response = requests.get(url, timeout=self.timeout)
+        except requests.RequestException as exc:
+            self._set_last_error("site-people request failed")
+            raise _HttpPressure("site-people request failed") from exc
+        try:
+            body = response.text or ""
+        except Exception:  # noqa: BLE001
+            body = ""
+        status = int(getattr(response, "status_code", 0) or 0)
+        redacted = _redact(body or (f"http {status}" if status else "site-people request failed"), key)
+        marker_hit = SLOT_MARKER in (body or "").lower() or SLOT_MARKER in redacted.lower()
+        if marker_hit:
+            self._set_last_error(redacted)
+            raise _SlotBusy(redacted)
+        if status == 429 or status >= 500:
+            self._set_last_error(redacted)
+            raise _HttpPressure(
+                f"site-people {mode} failed ({status}): {redacted}"
+            )
+        if status >= 400:
+            self._set_last_error(redacted)
+            raise RuntimeError(
+                f"site-people {mode} failed ({status}): {redacted}"
+            )
         return body
 
     def load_domains(self, domains: list[str], batch: str) -> dict[str, Any]:
@@ -197,35 +262,73 @@ class SitePeopleClient:
             data = data[0]
         return data if isinstance(data, dict) else {}
 
-    def _poll(self, *, mode: str, batch: str, n: int, w: int, inflight: int, remaining_key: str) -> None:
-        busy_sleeps = 0
-        while True:
-            stats = self.remaining(batch)
-            left = int(stats.get(remaining_key) or 0)
-            if left <= 0:
-                return
-            workers = min(inflight, max(1, (left + n - 1) // n))
-            try:
-                if workers <= 1:
-                    self._call_edge(mode=mode, batch=batch, n=n, w=w)
+    def _poll(self, *, mode: str, batch: str, n: int, w: int, remaining_key: str) -> None:
+        """Keep a worker pool busy until the batch remaining count hits 0.
+
+        DB writes stay on the batched RPCs (load / remaining / roster / picks).
+        Only the site-people edge HTTP calls run in parallel. On slot-reserved
+        or 429/5xx, sleep with jitter and shrink the live limit — do not fan
+        more workers back out.
+        """
+        current = self._live_concurrency()
+        pressure_hits = 0
+        pending: set[Future[str]] = set()
+
+        with ThreadPoolExecutor(max_workers=MAX_SITE_PEOPLE_CONCURRENCY) as pool:
+            while True:
+                stats = self.remaining(batch)
+                left = int(stats.get(remaining_key) or 0)
+                inflight = len(pending)
+                if left <= 0 and inflight == 0:
+                    return
+
+                # remaining() still counts domains an in-flight call has not
+                # claimed yet. Subtract those workers so we do not fan out a
+                # second wave on top of the live pool.
+                room = max(0, current - inflight)
+                effective = max(0, left - inflight)
+                if room == 0 or effective == 0:
+                    workers, n_each = 0, n
                 else:
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        futs = [
-                            pool.submit(self._call_edge, mode=mode, batch=batch, n=n, w=w)
-                            for _ in range(workers)
-                        ]
-                        for fut in as_completed(futs):
-                            fut.result()
-            except _SlotBusy:
-                busy_sleeps += 1
-                log.warning("site-people %s backing off %ss (slot reserved)", mode, SLOT_BACKOFF_S)
-                time.sleep(SLOT_BACKOFF_S)
-                if busy_sleeps >= 8:
-                    raise RuntimeError(
-                        f"site-people {mode} exhausted connection-slot backoff"
-                    )
-                continue
-            busy_sleeps = 0
+                    workers, n_each = plan_wave(effective, n, room)
+                if workers:
+                    self.wave_sizes.append(inflight + workers)
+                    for _ in range(workers):
+                        pending.add(
+                            pool.submit(
+                                self._call_edge,
+                                mode=mode,
+                                batch=batch,
+                                n=n_each,
+                                w=w,
+                            )
+                        )
+
+                if not pending:
+                    return
+
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        fut.result()
+                    except _Pressure as exc:
+                        pressure_hits += 1
+                        current = self._reduce_concurrency()
+                        delay = pressure_backoff_s(exc.kind, pressure_hits)
+                        log.warning(
+                            "site-people %s %s; backoff %.1ss limit=%s",
+                            mode,
+                            exc.kind,
+                            delay,
+                            current,
+                        )
+                        time.sleep(delay)
+                        if pressure_hits >= PRESSURE_EXHAUST:
+                            raise RuntimeError(
+                                f"site-people {mode} exhausted connection-slot backoff"
+                            ) from exc
+                    else:
+                        pressure_hits = 0
 
     def poll_fetch(self, batch: str) -> None:
         self._poll(
@@ -233,7 +336,6 @@ class SitePeopleClient:
             batch=batch,
             n=FETCH_N,
             w=FETCH_W,
-            inflight=FETCH_IN_FLIGHT,
             remaining_key="fetch_remaining",
         )
 
@@ -243,7 +345,6 @@ class SitePeopleClient:
             batch=batch,
             n=EXTRACT_N,
             w=EXTRACT_W,
-            inflight=EXTRACT_IN_FLIGHT,
             remaining_key="extract_remaining",
         )
 
@@ -424,5 +525,13 @@ def _custom_picks(
     return out
 
 
-class _SlotBusy(RuntimeError):
-    pass
+class _Pressure(RuntimeError):
+    kind = "http"
+
+
+class _SlotBusy(_Pressure):
+    kind = "slot"
+
+
+class _HttpPressure(_Pressure):
+    kind = "http"
