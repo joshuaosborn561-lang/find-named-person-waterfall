@@ -34,6 +34,7 @@ def get(
     headers: dict[str, str] | None = None,
     timeout: int = 45,
     params: object | None = None,
+    max_attempts: int | None = None,
 ) -> requests.Response | None:
     return request_with_retry(
         tier,
@@ -42,4 +43,5 @@ def get(
         headers=headers,
         timeout=timeout,
         params=params,
+        max_attempts=max_attempts,
     )

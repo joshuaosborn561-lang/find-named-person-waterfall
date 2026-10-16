@@ -49,8 +49,10 @@ are listed on unrecognized_tiers — they are not silently dropped.
 site_people loads domains into topup.site_people_text (batch
 fnp_<client_tag>_<job_id>), reuses a fetch ≤30 days old by updating
 batch only, then polls the site-people edge function (fetch n=70
-w=8 max 3 in flight; extract n=50 w=10 max 2 in flight). Back off
-60s on "remaining connection slots are reserved". Capture every
+w=8; extract n=50 w=10) with a worker pool sized by
+SITE_PEOPLE_CONCURRENCY (default 6, max 12). On "remaining
+connection slots are reserved" or 429/5xx, back off with jitter and
+reduce concurrency instead of fanning out. Capture every
 named person; pick the DM in SQL (site_dm_pick, or site_pick_titles
 with the same ignored-title words). Ties>1 write backups. Unpicked
 rows are wf_people_status=site_unpicked. DiscoLike runs only on

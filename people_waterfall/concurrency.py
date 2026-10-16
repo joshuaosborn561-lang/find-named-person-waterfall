@@ -16,6 +16,7 @@ TIER_ENV_KEYS: dict[str, str] = {
     "prospeo_search": "PROSPEO_CONCURRENCY",
     "aiark_people": "AI_ARK_CONCURRENCY",
     "getleads": "GETLEADS_CONCURRENCY",
+    "site_people": "SITE_PEOPLE_CONCURRENCY",
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
@@ -23,7 +24,11 @@ DEFAULT_VENDOR_LIMITS: dict[str, int] = {
     "prospeo_search": 2,
     "aiark_people": 6,
     "getleads": 1,
+    "site_people": 6,
 }
+
+DEFAULT_SITE_PEOPLE_CONCURRENCY = 6
+MAX_SITE_PEOPLE_CONCURRENCY = 12
 
 DEFAULT_COMPANY_CONCURRENCY = 20
 
@@ -42,7 +47,20 @@ def company_concurrency() -> int:
     return _env_int("COMPANY_CONCURRENCY", DEFAULT_COMPANY_CONCURRENCY)
 
 
+def site_people_concurrency() -> int:
+    """Worker-pool size for site-people fetch/extract. Default 6, hard cap 12."""
+    raw = (os.environ.get("SITE_PEOPLE_CONCURRENCY") or "").strip()
+    if not raw:
+        return DEFAULT_SITE_PEOPLE_CONCURRENCY
+    try:
+        return max(1, min(MAX_SITE_PEOPLE_CONCURRENCY, int(raw)))
+    except ValueError:
+        return DEFAULT_SITE_PEOPLE_CONCURRENCY
+
+
 def vendor_concurrency(tier: str) -> int:
+    if tier == "site_people":
+        return site_people_concurrency()
     key = TIER_ENV_KEYS.get(tier)
     default = DEFAULT_VENDOR_LIMITS.get(tier, 4)
     return _env_int(key or "", default) if key else default
