@@ -244,6 +244,7 @@ class PersonHit:
     name_bank_status: str = ""
     title_rank: int | None = None
     aiark_person_id: str = ""
+    backup: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property

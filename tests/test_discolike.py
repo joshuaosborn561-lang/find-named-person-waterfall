@@ -12,6 +12,7 @@ from people_waterfall.vendors.discolike import (
     unit_usd,
 )
 from people_waterfall.waterfall import VendorBundle, resolve_people
+from tests.fakes import EmptyGetleads, EmptySitePeople
 
 
 PROFILE = parse_profile(
@@ -103,6 +104,8 @@ def _bundle(disco=None) -> VendorBundle:
     return VendorBundle(
         cache=_Empty(),
         discolike=disco or _Disco(),
+        site_people=EmptySitePeople(),
+        getleads=EmptyGetleads(),
         prospeo=_NoopPaid(),
         aiark=_NoopPaid(),
     )
@@ -219,6 +222,8 @@ def _run(monkeypatch, rows, vendors, **kwargs):
     monkeypatch.setattr(wf, "writeback_people", kwargs.pop("writeback_fn", lambda *a, **k: None))
     monkeypatch.setattr(wf, "persist_discolike_icp", lambda *a, **k: None)
     monkeypatch.setattr(wf, "merge_people_measured_rates", lambda *a, **k: None)
+    if "SITE_PEOPLE_KEY" not in kwargs:
+        monkeypatch.setenv("SITE_PEOPLE_KEY", "test-site-people-key")
     write = kwargs.pop("write_supabase", False)
     return resolve_people(
         source_table="public.emcor_companies",
@@ -246,8 +251,9 @@ def test_estimate_only_emcor_unresolved_selects_and_prices_discolike(monkeypatch
     assert result["source_table"] == "public.emcor_companies"
     assert "discolike" in result["selected_tiers"]
     assert result["selected_tiers"] == [
-        "site_staff",
         "cache",
+        "site_people",
+        "getleads",
         "discolike",
         "prospeo_search",
         "aiark_people",
@@ -276,6 +282,8 @@ def test_missing_key_fails_before_later_paid_tiers(monkeypatch):
             VendorBundle(
                 cache=_Empty(),
                 discolike=_OffDisco(),
+                site_people=EmptySitePeople(),
+                getleads=EmptyGetleads(),
                 prospeo=later,
                 aiark=later,
             ),
@@ -300,7 +308,14 @@ def test_later_paid_tiers_run_only_without_title_match(monkeypatch):
     result = _run(
         monkeypatch,
         rows,
-        VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=prospeo, aiark=aiark),
+        VendorBundle(
+            cache=_Empty(),
+            discolike=_Disco(),
+            site_people=EmptySitePeople(),
+            getleads=EmptyGetleads(),
+            prospeo=prospeo,
+            aiark=aiark,
+        ),
         progress_callback=_progress,
     )
     assert "acme.com" not in prospeo.seen
@@ -330,7 +345,14 @@ def test_write_failure_stops_before_next_tier(monkeypatch):
         _run(
             monkeypatch,
             rows,
-            VendorBundle(cache=_Empty(), discolike=_Disco(), prospeo=prospeo, aiark=aiark),
+            VendorBundle(
+                cache=_Empty(),
+                discolike=_Disco(),
+                site_people=EmptySitePeople(),
+                getleads=EmptyGetleads(),
+                prospeo=prospeo,
+                aiark=aiark,
+            ),
             write_supabase=True,
             write_contacts_fn=_boom,
         )
@@ -396,6 +418,19 @@ def test_emcor_source_maps_domain_column(monkeypatch):
     )
     source_mod.discover_column_map(src)
     assert src.column_map["domain"] == "domain"
+
+
+def test_source_prefers_wf_domain(monkeypatch):
+    from people_waterfall import source as source_mod
+
+    src = TableSource(project_id="x", schema="public", table="emcor_companies")
+    monkeypatch.setattr(
+        source_mod,
+        "list_columns",
+        lambda _src: {"id", "wf_domain", "domain", "company_name"},
+    )
+    source_mod.discover_column_map(src)
+    assert src.column_map["domain"] == "wf_domain"
 
 
 def test_job_writes_title_match_and_skips_no_domain(monkeypatch):

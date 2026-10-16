@@ -35,25 +35,32 @@ Waterfall `ensure_profile` creates the row.
 
 ## Ordering
 
-Default people_tier_order is site_staff → cache → discolike →
-prospeo_search → aiark_people. site_staff is free and runs first.
+Default people_tier_order is cache → site_people → getleads →
+discolike → prospeo_search → aiark_people. site_people is free and
+force-included unless a receipt dropped it. getleads is free (plan
+credits) and is not force-included. site_staff stays published for
+one release; max_tier=site_staff runs that tier alone.
 A receipt may drop a zero-yield default tier; it does not
 cheapest-sort the declared order. Legacy leadmagic_employee /
 leadmagic_role names in a profile or request are no-ops with a
 warning (deprecated_tiers). Unrecognized names in a custom order
 are listed on unrecognized_tiers — they are not silently dropped.
 
-site_staff reads public.site_pages, then fetches up to 8 same-site
-staff/team/about/contact pages (registrable domain match; www and
-subdomains allowed). Off-site links are dropped. Emails must be on
-the source domain or the homepage canonical/redirect. Names must be
-2–4 capitalized tokens after honorifics are stripped; nav/heading
-stoplist tokens are rejected. Titles come from the same staff card
-or the adjacent line only. Generic inboxes (office, info, treasurer)
-stay on the company row (`wf_email_pattern`); they are never a
-contact email. name_bank only stores a valid name plus a usable
-title. After the first 50 domains, if under 80% of written contacts
-have valid names the job pauses (`site_staff_quality`).
+site_people loads domains into topup.site_people_text (batch
+fnp_<client_tag>_<job_id>), reuses a fetch ≤30 days old by updating
+batch only, then polls the site-people edge function (fetch n=70
+w=8 max 3 in flight; extract n=50 w=10 max 2 in flight). Back off
+60s on "remaining connection slots are reserved". Capture every
+named person; pick the DM in SQL (site_dm_pick, or site_pick_titles
+with the same ignored-title words). Ties>1 write backups. Unpicked
+rows are wf_people_status=site_unpicked. DiscoLike runs only on
+unpicked, non-cut org_types (unreadable sites still go). 100+
+domains with 0 picks fails the job. SITE_PEOPLE_KEY is required;
+a missing or empty key fails before any HTTP. Counters:
+loaded/fetched/extracted/picked/sent_on/dollars.
+
+site_staff is the previous website-staff tier and still reads
+public.site_pages. Missing site_pages columns fail that tier.
 max_tier=site_staff runs only that tier.
 
 Before any paid call the job checks the profile, source table,
@@ -94,7 +101,7 @@ title_match, title_rank, linkedin_url, domain, company_name, source_tier,
 source_confidence, phone, person_city, person_state.
 
 Writeback on the source row: wf_people_count, wf_people_source, wf_people_status
-in resolved | partial | deferred | people_unresolved.
+in resolved | partial | deferred | people_unresolved | site_unpicked.
 
 Never touch dl_status, sg_exclude, or skip_*.
 

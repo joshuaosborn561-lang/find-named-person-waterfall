@@ -15,12 +15,14 @@ TIER_ENV_KEYS: dict[str, str] = {
     "discolike": "DISCOLIKE_CONCURRENCY",
     "prospeo_search": "PROSPEO_CONCURRENCY",
     "aiark_people": "AI_ARK_CONCURRENCY",
+    "getleads": "GETLEADS_CONCURRENCY",
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
     "discolike": 1,
     "prospeo_search": 2,
     "aiark_people": 6,
+    "getleads": 1,
 }
 
 DEFAULT_COMPANY_CONCURRENCY = 20

@@ -18,6 +18,7 @@ API_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "discolike": ("discolike", "discolike_api_key", "DISCOLIKE_API_KEY", "DISCO_API_KEY"),
     "ai_ark": ("ai_ark", "aiark", "ai_ark_api_key", "AI_ARK_API_KEY", "AIARK_API_KEY"),
     "prospeo": ("prospeo", "prospeo_api_key", "PROSPEO_API_KEY"),
+    "getleads": ("getleads", "getleads_api_key", "GETLEADS_API_KEY"),
 }
 
 
@@ -33,6 +34,7 @@ class Settings:
     discolike_api_key: str
     ai_ark_api_key: str
     prospeo_api_key: str
+    getleads_api_key: str
     email_waterfall_url: str
 
     @property
@@ -52,6 +54,7 @@ def load_settings() -> Settings:
         discolike_api_key=_env("DISCOLIKE_API_KEY") or _env("DISCO_API_KEY"),
         ai_ark_api_key=_env("AI_ARK_API_KEY") or _env("AIARK_API_KEY"),
         prospeo_api_key=_env("PROSPEO_API_KEY"),
+        getleads_api_key=_env("GETLEADS_API_KEY"),
         email_waterfall_url=_env("EMAIL_WATERFALL_URL").rstrip("/"),
     )
 
@@ -85,5 +88,6 @@ def merge_private_keys(rows: list[dict[str, str]]) -> Settings:
         discolike_api_key=pick(settings.discolike_api_key, *API_KEY_ALIASES["discolike"]),
         ai_ark_api_key=pick(settings.ai_ark_api_key, *API_KEY_ALIASES["ai_ark"]),
         prospeo_api_key=pick(settings.prospeo_api_key, *API_KEY_ALIASES["prospeo"]),
+        getleads_api_key=pick(settings.getleads_api_key, *API_KEY_ALIASES["getleads"]),
     )
     return updated

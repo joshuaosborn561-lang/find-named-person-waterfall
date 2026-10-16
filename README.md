@@ -12,7 +12,7 @@ size bands, ground truth, and cache tables come from
 
 | Tool | Purpose |
 | --- | --- |
-| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. `min_tier` / `skip_tiers` window the site_staff → cache → discolike → prospeo_search → aiark_people order. |
+| `resolve_people` | Page `source_table` + `where` (500/server-side). Estimate first. `min_tier` / `skip_tiers` window the cache → site_people → getleads → discolike → prospeo_search → aiark_people order. |
 | `receipt_test` | Score every people tier on ground truth. Write `people_tier_order`. |
 | `get_profile` | Read-only. Profiles are created by Domain Waterfall `ensure_profile`. |
 | `get_job_status` | Last known progress plus `counter` (`done`/`total`/`pct`). Never a bare error. |
@@ -20,14 +20,22 @@ size bands, ground truth, and cache tables come from
 
 ## Ordering
 
-Default people-tier order is site_staff → cache → discolike →
-prospeo_search → aiark_people. A receipt may drop a zero-yield people
-tier; it does not reorder the declared list. Legacy `leadmagic_*`
-names are accepted as no-ops with a warning. Unrecognized names in a
-custom `people_tier_order` are warned, not dropped silently. People
-Waterfall writes `people_tier_order` / `people_dropped_tiers` /
-`people_measured_rates`. It never reads or writes the domain
-resolver's shared `tier_order`.
+Default people-tier order is cache → site_people → getleads →
+discolike → prospeo_search → aiark_people. `site_people` is force-
+included unless a receipt dropped it. `site_staff` stays published
+for one release (`max_tier=site_staff` runs that tier alone). A
+receipt may drop a zero-yield people tier; it does not reorder the
+declared list. Legacy `leadmagic_*` names are accepted as no-ops
+with a warning. Unrecognized names in a custom `people_tier_order`
+are warned, not dropped silently. People Waterfall writes
+`people_tier_order` / `people_dropped_tiers` / `people_measured_rates`.
+It never reads or writes the domain resolver's shared `tier_order`.
+
+`SITE_PEOPLE_KEY` is required whenever `site_people` is selected.
+A missing or empty key fails the job before any fetch. Do not store
+the key on `Settings` or print it. Set it on the Railway service
+before deploy, and do not deploy while a `resolve_people` job is
+running.
 
 ## Writes
 

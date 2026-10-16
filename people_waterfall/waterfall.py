@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -37,7 +38,12 @@ from .source import (
     parse_source,
     writeback_people,
 )
-from .preflight import preflight_job
+from .preflight import (
+    preflight_job,
+    preflight_selected_tiers,
+    preflight_site_staff_columns,
+    require_site_people_key,
+)
 from .site_quality import (
     bankable_person,
     name_is_valid,
@@ -47,7 +53,13 @@ from .site_quality import (
 from .vendors.aiark import AiArkPeopleClient, TitlesRequired
 from .vendors.cache import CacheClient
 from .vendors.discolike import DiscoLikeClient
+from .vendors.getleads import GetLeadsPeopleClient
 from .vendors.prospeo import ProspeoSearchClient
+from .vendors.site_people import (
+    SitePeopleClient,
+    batch_name as site_people_batch_name,
+    discolike_eligible,
+)
 from .vendors.site_staff import SiteStaffClient
 from .write import (
     call_with_retry,
@@ -79,12 +91,18 @@ class VendorBundle:
     cache: CacheClient
     discolike: DiscoLikeClient
     site_staff: SiteStaffClient | None = None
+    site_people: SitePeopleClient | None = None
+    getleads: GetLeadsPeopleClient | None = None
     prospeo: ProspeoSearchClient | None = None
     aiark: AiArkPeopleClient | None = None
 
     def __post_init__(self) -> None:
         if self.site_staff is None:
             self.site_staff = SiteStaffClient(enabled=False)
+        if self.site_people is None:
+            self.site_people = SitePeopleClient(enabled=False)
+        if self.getleads is None:
+            self.getleads = GetLeadsPeopleClient(api_key="")
         if self.prospeo is None:
             self.prospeo = ProspeoSearchClient(api_key="")
         if self.aiark is None:
@@ -95,6 +113,8 @@ class VendorBundle:
             "cache": self.cache,
             "discolike": self.discolike,
             "site_staff": self.site_staff,
+            "site_people": self.site_people,
+            "getleads": self.getleads,
             "prospeo_search": self.prospeo,
             "aiark_people": self.aiark,
         }.get(tier)
@@ -105,6 +125,8 @@ def build_vendors() -> VendorBundle:
         cache=CacheClient(),
         discolike=DiscoLikeClient(),
         site_staff=SiteStaffClient(),
+        site_people=SitePeopleClient(),
+        getleads=GetLeadsPeopleClient(),
         prospeo=ProspeoSearchClient(),
         aiark=AiArkPeopleClient(),
     )
@@ -176,6 +198,8 @@ def _call_tier(
         return vendors.aiark.find_people(**kwargs) if vendors.aiark is not None else []
     if tier == "prospeo_search":
         return vendors.prospeo.find_people(**kwargs) if vendors.prospeo is not None else []
+    if tier == "getleads":
+        return vendors.getleads.find_people(**kwargs) if vendors.getleads is not None else []
     return client.find_people(**kwargs)
 
 
@@ -240,6 +264,11 @@ class _CompanyWork:
     reason: str = ""
     email_pattern: str = ""
     email_pattern_confidence: float | None = None
+    org_name: str = ""
+    org_type: str = ""
+    site_unpicked: bool = False
+    site_readable: bool = False
+    site_picked: bool = False
 
 
 def _audit_people(
@@ -445,6 +474,11 @@ def resolve_people(
         skip_tiers=skip_tiers,
     )
     skipped = parse_tier_list(skip_tiers)
+    preflight_selected_tiers(allowed)
+    if "site_staff" in allowed and write_supabase and not estimate_only:
+        preflight_site_staff_columns()
+    job_id = uuid.uuid4().hex[:12]
+    people_batch = site_people_batch_name(tag, job_id)
 
     if "aiark_people" in allowed and not list(profile.target_titles):
         raise TitlesRequired(
@@ -510,6 +544,14 @@ def resolve_people(
             "quality_domains": 0,
             "quality_written": 0,
             "quality_valid": 0,
+        },
+        "site_people": {
+            "loaded": 0,
+            "fetched": 0,
+            "extracted": 0,
+            "picked": 0,
+            "sent_on": 0,
+            "dollars": 0.0,
         },
         "per_tier": {t: {"calls": 0, "people": 0, "title_matched": 0, "usd": 0.0} for t in allowed},
     }
@@ -666,6 +708,8 @@ def resolve_people(
             return "deferred"
         if work.accepted_rows:
             return "resolved"
+        if work.site_unpicked:
+            return "site_unpicked"
         if work.bank_count:
             return "partial"
         return "people_unresolved"
@@ -738,7 +782,7 @@ def resolve_people(
 
     def run_pass(work: _CompanyWork, tiers: list[str], titles: list[str], fallback: bool) -> None:
         for tier in tiers:
-            if tier in {"discolike", "site_staff", "prospeo_search"}:
+            if tier in {"discolike", "site_staff", "site_people", "prospeo_search", "getleads"}:
                 continue
             if work.accepted_rows:
                 return
@@ -1084,6 +1128,159 @@ def resolve_people(
                 break
         _flush(targets, finished=False)
 
+    def run_site_people_batch(works: list[_CompanyWork]) -> None:
+        targets = [
+            work
+            for work in works
+            if work.domain and "site_people" not in work.tiers_called
+        ]
+        if not targets or "site_people" not in allowed:
+            return
+        require_site_people_key()
+        client = bundle.site_people
+        if client is None or not getattr(client, "enabled", True):
+            raise RuntimeError(
+                "site_people is selected but SITE_PEOPLE_KEY is missing; "
+                "refusing to run with an empty key"
+            )
+        emit("site_people")
+        companies = {work.domain: work.company for work in targets if work.domain}
+        packed = client.resolve_domains(
+            [work.domain for work in targets],
+            profile=profile,
+            companies=companies,
+            batch=people_batch,
+            job_id=job_id,
+            client_tag=tag,
+        )
+        block = stats["site_people"]
+        block["loaded"] = int(getattr(packed, "loaded", 0) or 0)
+        block["fetched"] = int(getattr(packed, "fetched", 0) or 0)
+        block["extracted"] = int(getattr(packed, "extracted", 0) or 0)
+        block["picked"] = int(getattr(packed, "picked", 0) or 0)
+        block["dollars"] = float(getattr(packed, "dollars", 0) or 0)
+        by_domain: dict[str, list[_CompanyWork]] = {}
+        for work in targets:
+            by_domain.setdefault(work.domain, []).append(work)
+        rows = getattr(packed, "by_domain", packed) if packed is not None else {}
+        for domain, group in by_domain.items():
+            result = rows.get(domain) if isinstance(rows, dict) else None
+            primary = group[0]
+            primary.tiers_called.add("site_people")
+            _tier_stat("site_people")["calls"] += 1
+            if result is None:
+                primary.site_unpicked = True
+                primary.reason = primary.reason or "site_unpicked"
+                for sibling in group[1:]:
+                    sibling.tiers_called.add("site_people")
+                    sibling.site_unpicked = True
+                    sibling.reason = sibling.reason or "site_unpicked"
+                continue
+            primary.org_name = str(getattr(result, "org_name", "") or "")
+            primary.org_type = str(getattr(result, "org_type", "") or "")
+            primary.site_readable = bool(
+                getattr(result, "extracted", False) or getattr(result, "fetched", False)
+            )
+            if primary.org_name:
+                primary.company = primary.org_name
+            pick = getattr(result, "pick", None)
+            backups = list(getattr(result, "backups", None) or [])
+            people = [p for p in [pick, *backups] if p is not None]
+            if people:
+                _tier_stat("site_people")["people"] += len(people)
+                _bill("site_people", people, unit=0.0, billing="free")
+                _apply_people(
+                    primary,
+                    "site_people",
+                    people,
+                    titles=list(profile.target_titles),
+                    fallback=False,
+                    source="site_people",
+                )
+            if getattr(result, "picked", False) or pick is not None:
+                primary.site_picked = True
+                primary.site_unpicked = False
+                primary.people_found = bool(primary.accepted_rows)
+                primary.last_source = "site_people"
+            else:
+                primary.site_picked = False
+                primary.site_unpicked = True
+                primary.reason = primary.reason or "site_unpicked"
+            for sibling in group[1:]:
+                adopt_sibling(primary, sibling)
+                sibling.tiers_called.add("site_people")
+                sibling.org_name = primary.org_name
+                sibling.org_type = primary.org_type
+                sibling.site_unpicked = primary.site_unpicked
+                sibling.site_picked = primary.site_picked
+                sibling.site_readable = primary.site_readable
+        if int(block["loaded"]) >= 100 and int(block["picked"]) <= 0:
+            raise RuntimeError(
+                "site_people loaded 100+ domains and picked 0; refusing to continue"
+            )
+        _flush(targets, finished=False)
+
+    def run_getleads_batch(works: list[_CompanyWork]) -> None:
+        if not works:
+            return
+        queued: list[_CompanyWork] = []
+        for work in works:
+            if work.accepted_rows:
+                continue
+            if not work.domain:
+                work.reason = work.reason or "no_domain"
+                continue
+            if "getleads" in work.tiers_called:
+                continue
+            queued.append(work)
+        if not queued:
+            return
+        if bundle.getleads is None or not bundle.getleads.enabled:
+            raise RuntimeError(
+                "getleads is selected but GETLEADS_API_KEY is missing; "
+                "refusing to fall through"
+            )
+        emit("getleads")
+        calls_before = int(getattr(bundle.getleads, "calls", 0) or 0)
+        companies = {work.domain: work.company for work in queued if work.domain}
+        packed = bundle.getleads.search_people(
+            [work.domain for work in queued],
+            profile=profile,
+            titles=target_titles,
+            companies=companies,
+        )
+        calls_made = int(getattr(bundle.getleads, "calls", 0) or 0) - calls_before
+        if calls_made <= 0:
+            raise RuntimeError(
+                getattr(bundle.getleads, "last_error", "")
+                or "getleads was selected but made 0 calls; refusing to fall through"
+            )
+        by_domain: dict[str, list[_CompanyWork]] = {}
+        for work in queued:
+            by_domain.setdefault(work.domain, []).append(work)
+        for domain, group in by_domain.items():
+            people = _unique_people(list(packed.get(domain) or []))
+            _tier_stat("getleads")["calls"] += 1
+            _tier_stat("getleads")["people"] += len(people)
+            _bill("getleads", people, unit=0.0, billing="free")
+            primary = group[0]
+            primary.tiers_called.add("getleads")
+            primary.last_source = "getleads"
+            primary.seen_people.extend(people)
+            _apply_people(
+                primary,
+                "getleads",
+                people,
+                titles=target_titles,
+                fallback=False,
+                source="getleads",
+            )
+            for sibling in group[1:]:
+                adopt_sibling(primary, sibling)
+                sibling.tiers_called.add("getleads")
+                sibling.last_source = "getleads"
+        _flush(queued, finished=False)
+
     def finalize(work: _CompanyWork) -> None:
         if work.finished:
             return
@@ -1103,6 +1300,7 @@ def resolve_people(
             finalize(work)
 
     pending_disco: list[_CompanyWork] = []
+    pending_getleads: list[_CompanyWork] = []
     pending_prospeo: list[_CompanyWork] = []
     pending_after: list[_CompanyWork] = []
     site_buf: list[_CompanyWork] = []
@@ -1137,6 +1335,9 @@ def resolve_people(
         if work.accepted_rows or work.deferred:
             finalize(work)
             return
+        if "getleads" in work.lane_order and work.domain and "getleads" not in work.tiers_called:
+            pending_getleads.append(work)
+            return
         if has_disco_for(work):
             if not work.domain:
                 work.reason = "no_domain"
@@ -1144,6 +1345,8 @@ def resolve_people(
                     return
                 finalize(work)
                 return
+            if "site_people" in work.tiers_called:
+                stats["site_people"]["sent_on"] += 1
             pending_disco.append(work)
             return
         if _queue_after_disco(work):
@@ -1162,7 +1365,13 @@ def resolve_people(
         finalize(work)
 
     def has_disco_for(work: _CompanyWork) -> bool:
-        return "discolike" in work.lane_order
+        if "discolike" not in work.lane_order:
+            return False
+        if work.accepted_rows:
+            return False
+        return discolike_eligible(
+            work.org_type, picked=bool(work.site_picked) or bool(work.accepted_rows)
+        )
 
     def drain_site(force: bool = False) -> None:
         if not site_buf:
@@ -1171,6 +1380,7 @@ def resolve_people(
             return
         batch = list(site_buf)
         site_buf.clear()
+        run_site_people_batch(batch)
         run_site_staff_batch(batch)
         if _note(len(batch)):
             for work in batch:
@@ -1201,7 +1411,11 @@ def resolve_people(
             before, rest = list(lane_order), []
         has_disco = "discolike" in rest or "discolike" in lane_order
         after = [t for t in rest if t != "discolike"]
-        before = [tier for tier in before if tier != "site_staff"]
+        before = [
+            tier
+            for tier in before
+            if tier not in {"site_staff", "site_people", "getleads"}
+        ]
         work = _CompanyWork(
             row=row,
             domain=domain,
@@ -1226,7 +1440,7 @@ def resolve_people(
             continue
         if domain:
             inflight[domain] = work
-        if "site_staff" in work.lane_order and domain:
+        if ("site_people" in work.lane_order or "site_staff" in work.lane_order) and domain:
             site_buf.append(work)
             drain_site(False)
             if deferred:
@@ -1239,6 +1453,46 @@ def resolve_people(
             break
 
     drain_site(True)
+
+    if pending_getleads and not deferred:
+        emit("getleads")
+        index = 0
+        while index < len(pending_getleads) and not deferred:
+            slice_works = pending_getleads[index : index + FLUSH_EVERY]
+            run_getleads_batch(slice_works)
+            for work in slice_works:
+                if work.finished:
+                    continue
+                if work.accepted_rows or work.deferred:
+                    finalize(work)
+                    continue
+                if has_disco_for(work):
+                    if work.domain:
+                        if "site_people" in work.tiers_called:
+                            stats["site_people"]["sent_on"] += 1
+                        pending_disco.append(work)
+                        continue
+                    work.reason = work.reason or "no_domain"
+                if _queue_after_disco(work):
+                    continue
+                if fallback_titles and work.seen_people:
+                    work.used_fallback = True
+                    _apply_people(
+                        work,
+                        work.last_source or "getleads",
+                        work.seen_people,
+                        titles=fallback_titles,
+                        fallback=True,
+                    )
+                finalize(work)
+            index += FLUSH_EVERY
+        if deferred:
+            finalize_rest(
+                [w for w in pending_getleads if not w.finished],
+                as_deferred=True,
+            )
+    elif pending_getleads:
+        finalize_rest(pending_getleads, as_deferred=True)
 
     if pending_disco and not deferred:
         emit("discolike")
@@ -1427,6 +1681,7 @@ def resolve_people(
             "row_failures": stats["row_failures"],
         },
         "site_staff": dict(stats["site_staff"]),
+        "site_people": dict(stats["site_people"]),
         "spent_usd": round(spent, 4),
         "contacts_written": int(stats["written"]),
         "title_matched": int(stats["title_matched"]),

@@ -161,7 +161,14 @@ def test_max_tier_site_staff_excludes_paid_tiers():
     order = compute_tier_order(rates=LiveRates())
     assert select_tiers(order, max_tier="site_staff") == ["site_staff"]
     paid = [row["tier"] for row in order if row["tier"] != "site_staff"]
-    assert paid == ["cache", "discolike", "prospeo_search", "aiark_people"]
+    assert paid == [
+        "cache",
+        "site_people",
+        "getleads",
+        "discolike",
+        "prospeo_search",
+        "aiark_people",
+    ]
 
 
 def test_spend_pause_after_100_companies_with_no_contacts():

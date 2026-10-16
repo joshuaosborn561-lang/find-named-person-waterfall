@@ -149,12 +149,16 @@ def rest_select(
     *,
     params: dict[str, str] | None = None,
     extra_headers: dict[str, str] | None = None,
+    schema: str = "public",
 ) -> list[dict[str, Any]]:
+    extra = dict(extra_headers or {})
+    if schema and schema != "public":
+        extra["Accept-Profile"] = schema
     _status, text = _request(
         "GET",
         table,
         prefer="return=representation",
-        extra_headers=extra_headers,
+        extra_headers=extra or None,
         query=params,
     )
     if not text:

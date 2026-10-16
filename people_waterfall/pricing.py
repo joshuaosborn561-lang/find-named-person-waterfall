@@ -1,8 +1,10 @@
 """Live unit prices for the people-tier list.
 
-Default order is site_staff → cache → discolike → prospeo_search →
-aiark_people. site_staff is free. A receipt may drop a zero-yield
-tier; it never reorders the declared sequence.
+Default order is cache → site_people → getleads → discolike →
+prospeo_search → aiark_people. site_people is free and is force-
+included unless a receipt dropped it. getleads is free (plan
+credits) and is not force-included. site_staff stays published for
+one release (max_tier=site_staff still runs that tier alone).
 
 Legacy LeadMagic tier names are accepted as no-ops (never silent
 substitutes for a paid vendor). Unrecognized names in a custom
@@ -42,6 +44,20 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "credits": 0.0,
         "unit_usd": 0.0,
         "receipt_lanes": ("domain", "name"),
+    },
+    "site_people": {
+        "needs": "domain",
+        "billing": "free",
+        "credits": 0.0,
+        "unit_usd": 0.0,
+        "receipt_lanes": ("domain",),
+    },
+    "getleads": {
+        "needs": "domain",
+        "billing": "free",
+        "credits": 0.0,
+        "unit_usd": 0.0,
+        "receipt_lanes": ("domain",),
     },
     "discolike": {
         "needs": "domain",
@@ -89,14 +105,18 @@ TIER_ALIASES = {
     "lm_search": "leadmagic_search_free",
     "disco": "discolike",
     "discogen": "discolike",
-    "site": "site_staff",
-    "website": "site_staff",
+    "site": "site_people",
+    "website": "site_people",
     "staff": "site_staff",
+    "site_staff": "site_staff",
+    "gl": "getleads",
+    "get_leads": "getleads",
 }
 
 DEFAULT_ORDER = [
-    "site_staff",
     "cache",
+    "site_people",
+    "getleads",
     "discolike",
     "prospeo_search",
     "aiark_people",
@@ -219,13 +239,18 @@ def compute_tier_order(
             continue
         seen.add(name)
         names.append(name)
-    # site_staff is free and runs before cache / any paid tier.
-    # An explicit people_tier_order that omits it still gets it first,
-    # unless a receipt dropped it. Paid order after that is unchanged.
-    if "site_staff" in dropped and "site_staff" in names:
-        names = [name for name in names if name != "site_staff"]
-    elif "site_staff" not in dropped:
-        names = ["site_staff", *[name for name in names if name != "site_staff"]]
+    # site_people is free and sits after cache. An explicit
+    # people_tier_order that omits it still gets it, unless a receipt
+    # dropped it. getleads is not force-included. site_staff is no
+    # longer prepended — keep it only when the profile or window names it.
+    if "site_people" in dropped:
+        names = [name for name in names if name != "site_people"]
+    elif "site_people" not in names:
+        if "cache" in names:
+            idx = names.index("cache") + 1
+            names = names[:idx] + ["site_people"] + names[idx:]
+        else:
+            names = ["site_people", *names]
     # Default (and explicit people_tier_order) keep declared sequence.
     # Receipt may drop a zero-yield tier; it does not cheapest-sort this list.
 
@@ -378,8 +403,14 @@ def select_tiers(
     if stop and is_legacy_noop(stop):
         stop = ""
 
-    if start or stop:
-        names = [row["tier"] for row in order]
+    live = [row["tier"] for row in order]
+    # A published max_tier that is not in the live order (site_staff after
+    # it left the default list) runs that tier alone. Appending it to the
+    # full order and slicing would silently include every preceding tier.
+    if stop and stop in PUBLISHED and stop not in live and (not start or start == stop):
+        names = [stop]
+    elif start or stop:
+        names = list(live)
         for extra in (start, stop):
             if extra and extra in PUBLISHED and extra not in names:
                 names.append(extra)

@@ -65,7 +65,7 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
         "contractor_name",
         "name",
     ),
-    "domain": ("domain", "website"),
+    "domain": ("wf_domain", "domain", "website"),
     "city": ("city", "address_city", "contact_city"),
     "state": ("state", "address_state", "contact_state"),
     "phone": ("phone", "cellphone", "mobile"),
