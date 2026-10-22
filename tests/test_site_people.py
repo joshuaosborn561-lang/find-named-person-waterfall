@@ -683,3 +683,76 @@ def test_call_edge_treats_request_exception_as_pressure(monkeypatch):
     with pytest.raises(_HttpPressure, match="request failed"):
         client._call_edge(mode="fetch", batch="fnp_t_1", n=8, w=8)
     assert "test-key" not in (client.last_error or "")
+
+
+def test_call_edge_raises_llm_unavailable_on_marker(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    client = SitePeopleClient()
+    body = '{"ok":false,"error":"llm_unavailable","detail":"gemini 402"}'
+    for status in (424, 200, 500):
+        monkeypatch.setattr(
+            site_people_mod.requests, "get", lambda *a, _s=status, **k: _Resp(_s, body)
+        )
+        with pytest.raises(site_people_mod.SitePeopleLlmUnavailable):
+            client._call_edge(mode="extract", batch="fnp_t_1", n=8, w=8)
+
+
+def test_poll_extract_stops_on_llm_unavailable_without_retry(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "1")
+    monkeypatch.setattr(site_people_mod.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_edge(*, mode, batch, n, w):
+        calls["n"] += 1
+        raise site_people_mod.SitePeopleLlmUnavailable("llm_unavailable")
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", lambda b: {"extract_remaining": 40})
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    with pytest.raises(site_people_mod.SitePeopleLlmUnavailable):
+        client.poll_extract("fnp_t_down")
+    assert calls["n"] == 1
+
+
+def test_poll_extract_stops_when_remaining_never_drops(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "2")
+    calls = {"n": 0}
+
+    def fake_edge(*, mode, batch, n, w):
+        calls["n"] += 1
+        return '{"processed": 5, "errors": 5, "remaining": 5}'
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", lambda b: {"extract_remaining": 5})
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    with pytest.raises(RuntimeError, match="no progress"):
+        client.poll_extract("fnp_t_stuck")
+    assert calls["n"] <= site_people_mod.NO_PROGRESS_LIMIT + 2
+
+
+def test_poll_extract_keeps_going_while_remaining_drops(monkeypatch):
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "1")
+    left = {"n": 10}
+
+    def fake_edge(*, mode, batch, n, w):
+        left["n"] -= 1
+        return "{}"
+
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "remaining", lambda b: {"extract_remaining": left["n"]})
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    monkeypatch.setattr(site_people_mod, "plan_wave", lambda eff, n, room: (1, 1))
+    client.poll_extract("fnp_t_ok")
+    assert left["n"] == 0
+
+
+def test_migration_015_skips_given_up_sites():
+    from pathlib import Path
+
+    sql = Path("supabase/migrations/015_site_people_remaining_gave_up.sql").read_text()
+    assert "create or replace function public.pw_site_people_remaining(" in sql.lower()
+    assert "x.gave_up_at IS NOT NULL OR x.attempts >= 3" in sql
+    assert "#variable_conflict use_variable" in sql

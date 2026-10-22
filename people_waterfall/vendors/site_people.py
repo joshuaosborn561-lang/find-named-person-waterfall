@@ -40,6 +40,10 @@ SLOT_BACKOFF_S = 60.0
 HTTP_BACKOFF_BASE_S = 5.0
 PRESSURE_EXHAUST = 8
 SLOT_MARKER = "remaining connection slots are reserved"
+LLM_UNAVAILABLE_MARKER = "llm_unavailable"
+# Stop a poll when this many edge calls in a row finish without the batch's
+# remaining count going down (failed sites being re-picked, LLM down, ...).
+NO_PROGRESS_LIMIT = 3
 CUT_ORG_TYPES = frozenset(
     {
         "school",
@@ -226,6 +230,11 @@ class SitePeopleClient:
             body = ""
         status = int(getattr(response, "status_code", 0) or 0)
         redacted = _redact(body or (f"http {status}" if status else "site-people request failed"), key)
+        if LLM_UNAVAILABLE_MARKER in (body or "").lower():
+            self._set_last_error(redacted)
+            raise SitePeopleLlmUnavailable(
+                f"site-people {mode} stopped: llm_unavailable ({status}): {redacted}"
+            )
         marker_hit = SLOT_MARKER in (body or "").lower() or SLOT_MARKER in redacted.lower()
         if marker_hit:
             self._set_last_error(redacted)
@@ -272,6 +281,8 @@ class SitePeopleClient:
         """
         current = self._live_concurrency()
         pressure_hits = 0
+        stalled = 0
+        last_left: int | None = None
         pending: set[Future[str]] = set()
 
         with ThreadPoolExecutor(max_workers=MAX_SITE_PEOPLE_CONCURRENCY) as pool:
@@ -281,6 +292,16 @@ class SitePeopleClient:
                 inflight = len(pending)
                 if left <= 0 and inflight == 0:
                     return
+                if last_left is not None and left < last_left:
+                    stalled = 0
+                last_left = left if last_left is None else min(last_left, left)
+                if left > 0 and stalled >= NO_PROGRESS_LIMIT:
+                    for fut in pending:
+                        fut.cancel()
+                    raise RuntimeError(
+                        f"site-people {mode} made no progress after {stalled} calls "
+                        f"(remaining={left}); stopping instead of re-calling the batch"
+                    )
 
                 # remaining() still counts domains an in-flight call has not
                 # claimed yet. Subtract those workers so we do not fan out a
@@ -311,6 +332,10 @@ class SitePeopleClient:
                 for fut in done:
                     try:
                         fut.result()
+                    except SitePeopleLlmUnavailable:
+                        for other in pending:
+                            other.cancel()
+                        raise
                     except _Pressure as exc:
                         pressure_hits += 1
                         current = self._reduce_concurrency()
@@ -329,6 +354,7 @@ class SitePeopleClient:
                             ) from exc
                     else:
                         pressure_hits = 0
+                        stalled += 1
 
     def poll_fetch(self, batch: str) -> None:
         self._poll(
@@ -531,6 +557,14 @@ class _Pressure(RuntimeError):
 
 class _SlotBusy(_Pressure):
     kind = "slot"
+
+
+class SitePeopleLlmUnavailable(RuntimeError):
+    """site-people extract said the LLM key is out of credit or blocked (402/403).
+
+    Never retried: the whole batch stops until the key is fixed.
+    """
+
 
 
 class _HttpPressure(_Pressure):
