@@ -13,7 +13,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import requests
@@ -44,6 +44,10 @@ LLM_UNAVAILABLE_MARKER = "llm_unavailable"
 # Stop a poll when this many edge calls in a row finish without the batch's
 # remaining count going down (failed sites being re-picked, LLM down, ...).
 NO_PROGRESS_LIMIT = 3
+# After a no-progress stop, retry the stalled remainder this many times with
+# backoff, then mark those domains as no-result. Never re-call forever.
+STALL_RETRIES = 2
+STALL_BACKOFF_BASE_S = 5.0
 CUT_ORG_TYPES = frozenset(
     {
         "school",
@@ -166,6 +170,13 @@ def pressure_backoff_s(kind: str, attempt: int) -> float:
     if kind == "slot":
         return SLOT_BACKOFF_S + random.uniform(0, 15.0)
     delay = min(60.0, HTTP_BACKOFF_BASE_S * (2 ** (hit - 1)))
+    return delay + random.uniform(0, 0.5)
+
+
+def stall_backoff_s(attempt: int) -> float:
+    """Sleep seconds before retrying a stalled remainder. Always jittered."""
+    hit = max(1, int(attempt))
+    delay = min(60.0, STALL_BACKOFF_BASE_S * (2 ** (hit - 1)))
     return delay + random.uniform(0, 0.5)
 
 
@@ -298,7 +309,7 @@ class SitePeopleClient:
                 if left > 0 and stalled >= NO_PROGRESS_LIMIT:
                     for fut in pending:
                         fut.cancel()
-                    raise RuntimeError(
+                    raise SitePeopleNoProgress(
                         f"site-people {mode} made no progress after {stalled} calls "
                         f"(remaining={left}); stopping instead of re-calling the batch"
                     )
@@ -374,6 +385,41 @@ class SitePeopleClient:
             remaining_key="extract_remaining",
         )
 
+    def _poll_or_give_up(
+        self, poller: Callable[[str], None], *, mode: str, batch: str
+    ) -> None:
+        """Run fetch/extract, retry a stalled remainder, then give up.
+
+        `_poll` still raises SitePeopleNoProgress after NO_PROGRESS_LIMIT
+        no-drop calls so a stuck batch is never re-called forever. This
+        wrapper retries that remainder a bounded number of times with
+        backoff, then returns so unresolved domains can be no-result.
+        """
+        for attempt in range(STALL_RETRIES + 1):
+            try:
+                poller(batch)
+                return
+            except SitePeopleNoProgress as exc:
+                if attempt >= STALL_RETRIES:
+                    log.warning(
+                        "site-people %s giving up on stalled remainder after %s "
+                        "retries (no-result for unresolved domains): %s",
+                        mode,
+                        STALL_RETRIES,
+                        exc,
+                    )
+                    return
+                delay = stall_backoff_s(attempt + 1)
+                log.warning(
+                    "site-people %s stalled; retrying remainder in %.1ss (%s/%s): %s",
+                    mode,
+                    delay,
+                    attempt + 1,
+                    STALL_RETRIES,
+                    exc,
+                )
+                time.sleep(delay)
+
     def roster(self, batch: str) -> list[dict[str, Any]]:
         data = supabase_sync.rpc("pw_site_people_roster", {"p_batch": batch})
         if isinstance(data, list):
@@ -410,8 +456,8 @@ class SitePeopleClient:
             return out
         loaded = self.load_domains(hosts, name)
         out.loaded = int(loaded.get("loaded") or loaded.get("domains") or len(hosts))
-        self.poll_fetch(name)
-        self.poll_extract(name)
+        self._poll_or_give_up(self.poll_fetch, mode="fetch", batch=name)
+        self._poll_or_give_up(self.poll_extract, mode="extract", batch=name)
         stats = self.remaining(name)
         out.fetched = int(stats.get("fetched_ok") or 0)
         out.extracted = int(stats.get("extracted_ok") or 0)
@@ -563,6 +609,14 @@ class SitePeopleLlmUnavailable(RuntimeError):
     """site-people extract said the LLM key is out of credit or blocked (402/403).
 
     Never retried: the whole batch stops until the key is fixed.
+    """
+
+
+class SitePeopleNoProgress(RuntimeError):
+    """Batch remaining did not drop after NO_PROGRESS_LIMIT successful calls.
+
+    `_poll` raises this to stop an infinite re-call. resolve_domains retries
+    the remainder a bounded number of times, then marks leftovers no-result.
     """
 
 

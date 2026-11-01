@@ -14,6 +14,8 @@ from people_waterfall.source import TableSource
 from people_waterfall.vendors import site_people as site_people_mod
 from people_waterfall.vendors.site_people import (
     CUT_ORG_TYPES,
+    NO_PROGRESS_LIMIT,
+    STALL_RETRIES,
     SitePeopleBatchResult,
     SitePeopleClient,
     SitePeopleDomainResult,
@@ -730,6 +732,75 @@ def test_poll_extract_stops_when_remaining_never_drops(monkeypatch):
     with pytest.raises(RuntimeError, match="no progress"):
         client.poll_extract("fnp_t_stuck")
     assert calls["n"] <= site_people_mod.NO_PROGRESS_LIMIT + 2
+
+
+def test_stalled_extract_retries_then_job_completes(monkeypatch):
+    """A stuck extract batch must not fail resolve_people.
+
+    `_poll` still stops after NO_PROGRESS_LIMIT no-drop calls. resolve_domains
+    retries the remainder with backoff, then marks leftovers no-result so
+    later batches and tiers can run and the job completes.
+    """
+    monkeypatch.setenv("SITE_PEOPLE_KEY", "test-key")
+    monkeypatch.setenv("SITE_PEOPLE_CONCURRENCY", "1")
+    sleeps: list[float] = []
+    monkeypatch.setattr(site_people_mod.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(site_people_mod.random, "uniform", lambda a, b: 0.0)
+    edge_calls = {"n": 0}
+
+    def fake_edge(*, mode, batch, n, w):
+        edge_calls["n"] += 1
+        return '{"processed": 32, "errors": 32, "remaining": 32}'
+
+    def fake_rpc(name, body=None):
+        if name == "pw_site_people_load":
+            return {"loaded": 2, "reused": 0, "reset": 0, "inserted": 2}
+        if name == "pw_site_people_remaining":
+            return {
+                "fetch_remaining": 0,
+                "extract_remaining": 32,
+                "fetched_ok": 2,
+                "extracted_ok": 0,
+                "dollars": 0.0,
+            }
+        if name == "pw_site_people_roster":
+            return []
+        if name == "pw_site_people_picks":
+            return []
+        return {}
+
+    monkeypatch.setattr("people_waterfall.vendors.site_people.supabase_sync.rpc", fake_rpc)
+    client = SitePeopleClient()
+    monkeypatch.setattr(client, "_call_edge", fake_edge)
+    disco = _Disco()
+    rows = [
+        {"domain": "site-a.test", "company_name": "Co A", "_source_key": "1"},
+        {"domain": "site-b.test", "company_name": "Co B", "_source_key": "2"},
+    ]
+    result = _run(
+        monkeypatch,
+        rows,
+        VendorBundle(
+            cache=_Empty(),
+            discolike=disco,
+            site_people=client,
+            getleads=EmptyGetleads(),
+            prospeo=_NoopPaid(),
+            aiark=_NoopPaid(),
+        ),
+        max_tier="discolike",
+    )
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert edge_calls["n"] >= NO_PROGRESS_LIMIT
+    assert edge_calls["n"] <= (STALL_RETRIES + 1) * (NO_PROGRESS_LIMIT + 2)
+    assert len(sleeps) == STALL_RETRIES
+    assert sleeps[0] == 5.0
+    assert sleeps[1] == 10.0
+    assert result["site_people"]["loaded"] == 2
+    assert result["site_people"]["picked"] == 0
+    assert result["site_people"]["sent_on"] == 2
+    assert set(disco.seen) == {"site-a.test", "site-b.test"}
 
 
 def test_poll_extract_keeps_going_while_remaining_drops(monkeypatch):

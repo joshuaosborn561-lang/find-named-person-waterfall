@@ -56,7 +56,9 @@ from .vendors.discolike import DiscoLikeClient
 from .vendors.getleads import GetLeadsPeopleClient
 from .vendors.prospeo import ProspeoSearchClient
 from .vendors.site_people import (
+    SitePeopleBatchResult,
     SitePeopleClient,
+    SitePeopleNoProgress,
     batch_name as site_people_batch_name,
     discolike_eligible,
 )
@@ -1145,14 +1147,19 @@ def resolve_people(
             )
         emit("site_people")
         companies = {work.domain: work.company for work in targets if work.domain}
-        packed = client.resolve_domains(
-            [work.domain for work in targets],
-            profile=profile,
-            companies=companies,
-            batch=people_batch,
-            job_id=job_id,
-            client_tag=tag,
-        )
+        try:
+            packed = client.resolve_domains(
+                [work.domain for work in targets],
+                profile=profile,
+                companies=companies,
+                batch=people_batch,
+                job_id=job_id,
+                client_tag=tag,
+            )
+        except SitePeopleNoProgress:
+            # Remainder already retried inside resolve_domains. Never fail the
+            # job: mark this batch no-result and keep later batches/tiers.
+            packed = SitePeopleBatchResult(batch=people_batch)
         block = stats["site_people"]
         block["loaded"] = int(getattr(packed, "loaded", 0) or 0)
         block["fetched"] = int(getattr(packed, "fetched", 0) or 0)
